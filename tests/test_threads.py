@@ -1,7 +1,10 @@
 """V2 contracts use temporary native Hermes profiles and its tool dispatcher."""
 import time
+from importlib import import_module
+from types import SimpleNamespace
 
 from persistence.conversation.messages import NewMessage
+from persistence.conversation.sessions import NewSession
 from persistence_assembly import open_persistence, open_persistence_reader, profile_scope
 
 from test_local_delivery import call, install  # noqa: F401 -- fixture and shared dispatcher
@@ -47,6 +50,20 @@ def test_consent_is_bilateral_scoped_and_revocable(install):
     assert not call("read_thread", "sender", thread_id="recipient")["success"]
 
 
+def test_unlink_accepts_the_ended_current_segment_id(install):
+    connect()
+    with open_persistence(profile_scope(home=install)) as store:
+        store.sessions.end("recipient", "compression")
+        store.sessions.create(NewSession("recipient-tip", "desktop", parent_session_id="recipient",
+                                         cwd="/project/ui", git_repo_root="/project"))
+        store.sessions.end("recipient-tip", "agent_close")
+    peer = ok("list_threads", "sender")["threads"][0]
+    assert peer["thread_id"] == "recipient" and peer["session_id"] == "recipient-tip"
+    unlinked = ok("link_thread", "sender", thread_id=peer["session_id"], action="unlink")
+    assert unlinked["status"] == "unlinked" and unlinked["thread_id"] == "recipient"
+    assert ok("list_threads", "sender")["threads"] == []
+
+
 def test_message_and_wait_never_start_a_thread(install):
     connect()
     first = ok("wait_threads", "sender", threads=[{"thread_id": "recipient"}], wait_seconds=0)
@@ -71,6 +88,61 @@ def test_message_and_wait_never_start_a_thread(install):
     closed = ok("wait_threads", "sender", threads=[{"thread_id": "recipient", "after_row_id": result["row_id"]}],
                 wait_seconds=0)
     assert closed["status"] == "closed" and closed["closed"] == ["recipient"]
+
+
+def test_wait_observes_a_final_saved_after_polling_started(install, monkeypatch):
+    connect()
+    threads = import_module("peer-messaging.threads")
+    clock = [0.0]
+    saved = []
+
+    def finish_during_wait(seconds):
+        if not saved:
+            saved.append(append(install, "recipient", "assistant", "finished during the wait", finish_reason="stop"))
+        clock[0] += seconds
+
+    monkeypatch.setattr(threads, "time", SimpleNamespace(
+        time=time.time, monotonic=lambda: clock[0], sleep=finish_during_wait,
+    ))
+    result = threads.wait_threads({"threads": [{"thread_id": "recipient"}], "wait_seconds": 1}, "sender")
+    assert saved, "The final must be persisted after the first poll"
+    assert result["status"] == "ready", result
+    assert result["ready"][0]["result"]["text"] == "finished during the wait"
+    assert result["pending"] == []
+
+
+def test_tool_traffic_does_not_hide_a_saved_final(install):
+    connect()
+    append(install, "recipient", "assistant", "finished before the tool traffic", finish_reason="stop")
+    with open_persistence(profile_scope(home=install)) as store:
+        store.messages.append_batch("recipient", [
+            NewMessage("tool", f"private tool result {i}", tool_call_id=f"call-{i}") for i in range(120)
+        ] + [NewMessage("user", "private runtime notification", display_kind="notification") for _ in range(90)])
+    append(install, "recipient", "user", "new visible ask")
+    read = ok("read_thread", "sender", thread_id="recipient")
+    assert [message["text"] for message in read["messages"]] == ["finished before the tool traffic", "new visible ask"]
+    assert read["latest_final_row_id"] == read["messages"][0]["row_id"]
+    result = ok("wait_threads", "sender", threads=[{"thread_id": "recipient"}], wait_seconds=0)
+    assert result["status"] == "ready"
+    assert result["ready"][0]["result"]["text"] == "finished before the tool traffic"
+
+
+def test_exhausted_final_scan_is_reported_explicitly(install):
+    connect()
+    append(install, "recipient", "assistant", "older final", finish_reason="stop")
+    with open_persistence(profile_scope(home=install)) as store:
+        store.messages.append_batch("recipient", [
+            NewMessage("assistant", "hidden progress", display_kind="notification", finish_reason="stop")
+            for _ in range(81)
+        ])
+    read = ok("read_thread", "sender", thread_id="recipient")
+    assert read["messages"] == [] and read["latest_final_row_id"] is None
+    assert read["scan_limit_per_role"] == 80 and read["scan_limited_roles"] == ["assistant"]
+    result = ok("wait_threads", "sender", threads=[{"thread_id": "recipient"}], wait_seconds=0)
+    assert result["status"] == "scan_limit" and result["scan_limited"] == ["recipient"]
+    append(install, "recipient", "assistant", "new final", finish_reason="stop")
+    ready = ok("wait_threads", "sender", threads=[{"thread_id": "recipient"}], wait_seconds=0)
+    assert ready["status"] == "ready" and ready["scan_limited"] == []
 
 
 def test_create_is_explicit_independent_and_idle(install):

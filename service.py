@@ -6,7 +6,9 @@ import logging
 import math
 import os
 import re
+import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
@@ -55,6 +57,8 @@ def route(store, sid, *, follow=False, allow_ended=False):
         row = store.sessions.get(mailbox.session_component(segment))
         if row is None:
             raise ValueError("Unknown session; use an exact ID from peer_sessions")
+        if not store.sessions.owns_session(row.session_id):
+            raise ValueError("Peer routing cannot cross profiles")
         continues = index < len(chain) - 1
         valid_end = (continues and row.end_reason == END_REASON_COMPRESSION) or (not continues and allow_ended)
         if row.hidden or row.archived or (row.ended_at is not None and not valid_end):
@@ -74,22 +78,12 @@ def route(store, sid, *, follow=False, allow_ended=False):
 
 
 def receive_scope(home, sid, *, patience_s=None):
+    from . import teams
+
     inbox = root(home)
     with open_persistence_reader(home, patience_s=patience_s) as store:
-        own = row = route(store, sid)
-        ids = dict.fromkeys((row.session_id,))
-        while (parent := row.parent_session_id) and parent not in ids:
-            ancestor = store.sessions.get(mailbox.session_component(parent))
-            if ancestor is None or ancestor.end_reason != END_REASON_COMPRESSION:
-                break
-            try:
-                if route(store, parent, follow=True).session_id != own.session_id:
-                    break
-            except ValueError:
-                break
-            ids[parent] = None
-            row = ancestor
-        return own, [inbox / item for item in ids]
+        own = teams.resolve(store, sid, follow=False)
+        return own.row, [inbox / item for item in own.inbox_ids]
 
 
 def project(row):
@@ -108,63 +102,72 @@ def owners(home):
 
 
 def sessions(args, sid):
+    from . import teams, threads
+
     minutes, same = args.get("active_within_minutes", 60), args.get("same_project", True)
     if type(minutes) is not int or not 1 <= minutes <= 1440 or type(same) is not bool:
         raise ValueError("active_within_minutes must be 1–1440 and same_project must be boolean")
     home, cutoff = get_hermes_home(), time.time() - minutes * 60
-    with open_persistence_reader(home) as store:
-        own = route(store, sid, follow=True)
-        key = project(own) if same else None
+    with threads.graph(home) as links, open_persistence_reader(home) as store:
+        own = teams.resolve(store, sid)
+        key = project(own.root) if same else None
         if same and key is None:
             raise ValueError("This chat has no project path; use same_project=false")
         rows = store.sessions.list_sessions(
-            SessionQuery(sources=tuple(sorted(STORED)), local_created_sources=tuple(sorted(LOCAL)),
+            SessionQuery(sources=tuple(sorted(STORED | {"subagent"})), local_created_sources=tuple(sorted(LOCAL)),
+                         include_children=True, include_subagents=True,
                          order=SessionOrder.LAST_ACTIVE, project_compression_tips=False),
             SessionWindow(limit=SCAN_LIMIT), compact_rows=True,
         )
-        peers, seen = [], {own.session_id}
+        peers, seen = [], {own.row.session_id}
         for entry in rows:
             candidate = entry.session.session_id
             if candidate in seen:
                 continue
             try:
-                row = route(store, candidate, follow=True)
+                participant = teams.resolve(store, candidate)
             except ValueError:
                 continue
+            row = participant.row
             target = row.session_id
-            if target in seen or not same_profile(own.profile_name, row.profile_name):
+            if target in seen or not teams.allowed(own, participant, links):
                 continue
             seen.add(target)
             stamps = [row.started_at, row.last_activity_at, store.sessions.last_active(target)]
             if target == candidate:
                 stamps.append(entry.last_active)
             active = max((v for v in stamps if isinstance(v, (int, float)) and math.isfinite(v)), default=0)
-            if active < cutoff or (same and project(row) != key):
+            if active < cutoff or (same and project(participant.root) != key):
                 continue
-            peers.append({"session_id": target, "title": row.title, "source": surface(row), "cwd": row.cwd,
+            peers.append({**teams.describe(participant), "cwd": row.cwd,
                           "git_repo_root": row.git_repo_root, "last_active": active,
                           "last_activity_description": row.last_activity_description})
     live = owners(home) if peers else None
     for peer in peers:
         peer["owner_present"] = None if live is None else peer["session_id"] in live
     peers.sort(key=lambda peer: peer["last_active"], reverse=True)
-    return {"success": True, "session_id": own.session_id, "count": len(peers), "peers": peers,
+    return {"success": True, **teams.describe(own), "count": len(peers), "peers": peers,
             "same_project": same, "scan_limit": SCAN_LIMIT, "scan_may_be_truncated": len(rows) >= SCAN_LIMIT,
-            "note": "Recent activity and an open owner do not prove a running model turn. No automatic wake."}
+            "note": "Includes this team's children and teams of directly linked local chats. "
+                    "Recent activity and an open owner do not prove a running model turn. No automatic wake."}
 
 
-def send(args, sid):
+def send(args, sid, *, require_link=False):
+    from . import teams, threads
+
     home, requested = get_hermes_home(), args.get("target_session_id")
-    with open_persistence_reader(home) as store:
-        sender, target = route(store, sid, follow=True), route(store, requested, follow=True)
-        if not same_profile(sender.profile_name, target.profile_name):
-            raise ValueError("Peer messaging cannot cross profiles")
-        if sender.session_id == target.session_id:
+    with threads.graph(home) as links, open_persistence_reader(home) as store:
+        sender, target = teams.resolve(store, sid), teams.resolve(store, requested)
+        if sender.row.session_id == target.row.session_id:
             raise ValueError("Send to another chat, not your own chat or its compression aliases")
-    entry = mailbox.enqueue(root(home) / target.session_id, sender=sender.session_id, target=target.session_id,
+        if not teams.allowed(sender, target, links, require_link=require_link):
+            raise ValueError("These teams are not linked. Their independent parent chats must both use link_thread first.")
+    entry = mailbox.enqueue(root(home) / target.row.session_id, sender=sender.row.session_id, target=target.row.session_id,
                             text=args.get("message"), in_reply_to=args.get("in_reply_to"))
     return {"success": True, "status": "queued", "message_id": entry["message_id"],
-            "target_session_id": target.session_id, "requested_target_session_id": requested,
+            "target_session_id": target.row.session_id, "requested_target_session_id": requested,
+            "from_session_id": sender.row.session_id, "from_root_thread_id": sender.root_id,
+            "target_root_thread_id": target.root_id,
             "note": "Queued, not read or completed. Idle chats are never started."}
 
 
@@ -213,7 +216,7 @@ def pin_has_receive(pin):
 
 
 def hint(*, session_id, platform=None, **kwargs):
-    if platform not in LOCAL:
+    if platform not in LOCAL | {"subagent"}:
         return None
     try:
         home = get_hermes_home()
@@ -226,6 +229,50 @@ def hint(*, session_id, platform=None, **kwargs):
     return None
 
 
+class InboxNotices:
+    """Content-free, bounded reminders on new tool results in an existing turn."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.seen = OrderedDict()
+
+    def after_tool(self, *, tool_name, result, session_id="", turn_id="", **kwargs):
+        if tool_name == "peer_receive" or not session_id or not turn_id or not isinstance(result, str):
+            return None
+        try:
+            payload = json.loads(result)
+        except (ValueError, TypeError):
+            payload = None
+        else:
+            # Preserve JSON arrays/scalars. A later object or plaintext result
+            # can carry the notice without breaking the original result shape.
+            if not isinstance(payload, dict):
+                return None
+        try:
+            home = get_hermes_home()
+            if not root(home).is_dir():
+                return None
+            own, dirs = receive_scope(home, session_id, patience_s=0.05)
+            if not pin_has_receive(own.tool_pin):
+                return None
+            pending = mailbox.pending_ids(dirs)
+            key = (str(home), session_id, turn_id)
+            with self.lock:
+                previous = self.seen.pop(key, frozenset())
+                self.seen[key] = pending
+                while len(self.seen) > 256:
+                    self.seen.popitem(last=False)
+            if not pending or not pending - previous:
+                return None
+            if isinstance(payload, dict):
+                payload["_peer_inbox_notice"] = HINT
+                return json.dumps(payload, ensure_ascii=False)
+            return result + "\n\n[peer-messaging] " + HINT
+        except Exception:
+            LOG.debug("Mid-turn peer inbox hint unavailable; queued mail is untouched", exc_info=True)
+            return None
+
+
 def requirements():
     return store_exists(profile_scope())
 
@@ -234,6 +281,8 @@ def handler(operation):
     def call(args, *, session_id=None, **kwargs):
         try:
             result = operation(args, session_id)  # Host-supplied id, never the model's arguments.
+        except TimeoutError as exc:
+            result = {"success": False, "error": str(exc), "retryable": True}
         except (ValueError, OSError) as exc:
             result = {"success": False, "error": str(exc)}
         except Exception:
@@ -251,12 +300,14 @@ def register(ctx):
         ctx.register_tool(name=name, toolset=TOOLSET, schema=schema, handler=handler(operation),
                           check_fn=requirements, description="Local peer messaging", emoji=emoji)
 
-    tool("peer_sessions", sessions, "Find other local chats in this profile, by default in the same Git root or exact cwd. "
+    tool("peer_sessions", sessions, "Find local chats and delegated agents. Includes your own team and teams of directly linked parent chats. "
+         "Use exact session_id addresses; root_thread_id identifies each team. Defaults to the same Git root or exact cwd. "
          "Recent activity or an open owner does not prove a running turn.", {
              "active_within_minutes": {"type": "integer", "minimum": 1, "maximum": 1440, "default": 60},
              "same_project": {"type": "boolean", "default": True},
          })
-    tool("peer_send", send, "Queue a short coordination message to an exact peer_sessions ID without waking the chat. "
+    tool("peer_send", send, "Queue a coordination message to an exact peer_sessions ID without waking the recipient. "
+         "Parents and their delegated agents can communicate within a team; cross-team child traffic requires the parents' bilateral link. "
          "For a reply use from_session_id as the target and message_id as in_reply_to. Queued does not mean read.", {
              "target_session_id": {"type": "string"},
              "message": {"type": "string", "minLength": 1, "maxLength": mailbox.MAX_MESSAGE_CHARS},
@@ -270,3 +321,4 @@ def register(ctx):
              "wait_seconds": {"type": "number", "minimum": 0, "maximum": MAX_WAIT, "default": 0},
          }, emoji="📥")
     ctx.register_hook("pre_llm_call", hint)
+    ctx.register_hook("transform_tool_result", InboxNotices().after_tool)
