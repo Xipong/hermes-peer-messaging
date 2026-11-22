@@ -1,0 +1,21 @@
+name: peer-messaging
+version: 0.2.0
+manifest_version: 2
+api_version: 1
+description: Local Hermes conversations coordinate through linked threads and passive inboxes without waking idle chats.
+license: MIT
+author: Xipong
+provides_tools:
+  - peer_sessions
+  - peer_send
+  - peer_receive
+  - list_threads
+  - link_thread
+  - read_thread
+  - send_message_to_thread
+  - wait_threads
+  - create_thread
+  - message_peer
+provides_hooks:
+  - pre_llm_call
+  - subagent_start
