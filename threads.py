@@ -107,7 +107,7 @@ def link(args, sid):
         if action == "unlink" and pair(own_id, requested) in links:
             other_id = requested  # Revocation still works for an ended or deleted participant.
         else:
-            other_id, other = locate(store, requested)
+            other_id, other = locate(store, requested, allow_ended=action == "unlink")
             if action == "offer":
                 project_pair(own, other)
         key = pair(own_id, other_id)
@@ -130,9 +130,12 @@ def describe(key, row):
 
 
 def list_threads(args, sid):
+    from . import teams
+
     home = get_hermes_home()
     with graph(home) as links, open_persistence_reader(home) as store:
-        own_id, own = locate(store, sid)
+        participant = teams.resolve(store, sid)
+        own_id, own = participant.root_id, participant.root
         result = []
         for other_id, edge in neighbors(links, own_id):
             try:
@@ -142,7 +145,8 @@ def list_threads(args, sid):
                 continue
             state = "linked" if edge["since"] is not None else ("offered" if own_id in edge["offers"] else "incoming")
             result.append({**describe(other_id, other), "link": state})
-        return {"success": True, "thread_id": own_id, "threads": result}
+        return {"success": True, "thread_id": own_id, "session_id": participant.row.session_id,
+                "root_thread_id": own_id, "threads": result}
 
 
 def linked(store, links, own_id, own, target, *, allow_ended=False):
@@ -165,27 +169,55 @@ def text_only(value):
     return ""
 
 
-def recent(store, row, since):
-    out = []
-    for msg in store.messages.read_transcript(row.session_id, TranscriptRead(limit=_SCAN, latest=True)):
-        if msg.role not in {"user", "assistant"} or msg.timestamp < since or msg.compressed_summary or msg.display_kind or msg.tool_calls:
-            continue
-        meta = msg.display_metadata or {}
-        if msg.role == "assistant":
-            # Only an explicitly finished answer can satisfy a wait; commentary, errors and tool rows cannot.
-            if msg.finish_reason not in {"stop", "end_turn", "completed", "final", "final_answer"}:
-                continue
-            value = msg.content
-        else:
-            if meta.get("withheld_prompt") or msg.api_content is not None and "typed_ask" not in meta:
-                continue
-            value = meta.get("typed_ask", msg.content)
-        text = text_only(value)
-        if not text.strip():
-            continue
-        out.append({"row_id": int(msg.id), "role": msg.role, "text": text[:_MAX_TEXT],
-                    "truncated": len(text) > _MAX_TEXT, "timestamp": msg.timestamp})
-    return out
+def public_message(msg, since):
+    if msg.role not in {"user", "assistant"} or msg.timestamp < since or msg.compressed_summary or msg.display_kind or msg.tool_calls:
+        return None
+    meta = msg.display_metadata or {}
+    if msg.role == "assistant":
+        # Only an explicitly finished answer can satisfy a wait; commentary, errors and tool rows cannot.
+        if msg.finish_reason not in {"stop", "end_turn", "completed", "final", "final_answer"}:
+            return None
+        value = msg.content
+    else:
+        if meta.get("withheld_prompt") or msg.api_content is not None and "typed_ask" not in meta:
+            return None
+        value = meta.get("typed_ask", msg.content)
+    text = text_only(value)
+    if not text.strip():
+        return None
+    return {"row_id": int(msg.id), "role": msg.role, "text": text[:_MAX_TEXT],
+            "truncated": len(text) > _MAX_TEXT, "timestamp": msg.timestamp}
+
+
+def recent(store, row, since, *, limit=5, after=0, roles=("user", "assistant")):
+    out, limited = [], []
+    with store.messages.read_snapshot() as snapshot:
+        for role in roles:
+            found = 0
+            for offset in range(_SCAN):
+                candidate = store.messages.latest_row_id(row.session_id, role=role, offset=offset,
+                                                        require_text=role == "assistant")
+                if candidate is None or candidate <= after:
+                    break
+                # Select the exact active row, retaining summary/visibility metadata.
+                messages = store.messages.read_transcript(row.session_id, TranscriptRead(after_id=candidate - 1, limit=1))
+                if messages and messages[0].id == candidate:
+                    if message := public_message(messages[0], since):
+                        out.append(message)
+                        found += 1
+                        if found >= limit:
+                            break
+            else:
+                older = store.messages.latest_row_id(row.session_id, role=role, offset=_SCAN,
+                                                    require_text=role == "assistant")
+                if older is not None and older > after:
+                    limited.append(role)
+        if not snapshot():
+            raise ValueError("Thread transcript changed during the read; retry the observation")
+    out.sort(key=lambda message: message["row_id"])
+    final = next((message["row_id"] for message in reversed(out) if message["role"] == "assistant"), None)
+    return {"messages": out[-limit:], "latest_final_row_id": final,
+            "scan_limit_per_role": _SCAN, "scan_limited_roles": limited}
 
 
 def read_thread(args, sid):
@@ -196,19 +228,13 @@ def read_thread(args, sid):
     with graph(home) as links, open_persistence_reader(home) as store:
         own_id, own = locate(store, sid)
         other_id, row, since = linked(store, links, own_id, own, args.get("thread_id"), allow_ended=True)
-        data = recent(store, row, since)
-        last_final = next((m["row_id"] for m in reversed(data) if m["role"] == "assistant"), None)
-        return {"success": True, "authority": "peer_data", **describe(other_id, row), "messages": data[-limit:],
-                "latest_final_row_id": last_final, "shared_since": since,
-                "note": "Bounded public text from the current session segment after link acceptance; not a live turn status."}
+        data = recent(store, row, since, limit=limit)
+        return {"success": True, "authority": "peer_data", **describe(other_id, row), **data, "shared_since": since,
+                "note": "Public text from the current segment after link acceptance. scan_limited_roles names incomplete scans; not a live turn status."}
 
 
 def send_message(args, sid):
-    home = get_hermes_home()
-    with graph(home) as links, open_persistence_reader(home) as store:
-        own_id, own = locate(store, sid)
-        _, row, _ = linked(store, links, own_id, own, args.get("thread_id"))
-    return service.send({**args, "target_session_id": row.session_id}, sid)
+    return service.send({**args, "target_session_id": args.get("thread_id")}, sid, require_link=True)
 
 
 def wait_threads(args, sid):
@@ -231,16 +257,20 @@ def wait_threads(args, sid):
     while True:
         with graph(home) as links, open_persistence_reader(home) as store:
             own_id, own = locate(store, sid)
-            ready, pending, closed = [], [], []
+            ready, pending, closed, limited = [], [], [], []
             for target, cursor in cursors.items():
                 other_id, row, since = linked(store, links, own_id, own, target, allow_ended=True)
-                cursor_key = (row.session_id, row.transcript_revision, since)
+                # The row's transcript_revision tracks rewrites, not appends.
+                # The public fingerprint also changes when a new final is saved.
+                cursor_key = (row.session_id, store.messages.conversation_revision(row.session_id), since)
                 if target not in cached or cached[target][0] != cursor_key:
-                    final = next((m for m in reversed(recent(store, row, since)) if m["role"] == "assistant"
-                                  and m["row_id"] > cursor), None)
-                    cached[target] = (cursor_key, final)
+                    observation = recent(store, row, since, limit=1, after=cursor, roles=("assistant",))
+                    cached[target] = (cursor_key, observation)
                 else:
-                    final = cached[target][1]
+                    observation = cached[target][1]
+                final = next(iter(observation["messages"]), None)
+                if observation["scan_limited_roles"]:
+                    limited.append(other_id)
                 if final:
                     ready.append({"thread_id": other_id, "session_id": row.session_id, "result": final})
                 elif row.ended_at is not None:
@@ -249,9 +279,10 @@ def wait_threads(args, sid):
                     pending.append(other_id)
         remaining = deadline - time.monotonic()
         if ready or not pending or remaining <= 0:
-            status = "ready" if ready else "timeout" if pending else "closed"
+            status = "ready" if ready else "scan_limit" if limited else "timeout" if pending else "closed"
             return {"success": True, "authority": "peer_data", "status": status, "ready": ready,
-                    "pending": pending, "closed": closed, "note": "Observed saved finals only; no chat was started."}
+                    "pending": pending, "closed": closed, "scan_limited": limited, "scan_limit_per_role": _SCAN,
+                    "note": "Saved finals in the current segment only. scan_limited names incomplete scans; no chat was started."}
         time.sleep(min(0.75, remaining))
 
 
@@ -286,14 +317,14 @@ def register(ctx):
                               "description": description, "parameters": {"type": "object", "properties": properties,
                               "required": list(required), "additionalProperties": False}})
     id_field = {"type": "string", "description": "Exact thread_id or current session_id"}
-    add("list_threads", list_threads, "List only explicitly linked local chats and pending link offers. No wake.", {})
-    add("link_thread", link, "Propose a link to an exact same-project chat, or revoke it. Existing chats share only new public text after both independently offer. No prompt is sent.",
+    add("list_threads", list_threads, "List your team's directly linked local parent chats and pending offers. Delegated agents inherit their root parent's directory. No wake.", {})
+    add("link_thread", link, "For independent parent chats: propose or revoke a same-project link. Both parents must offer. The link also permits messaging between their delegated teams; it does not extend transitively to other links. Parents share new public text after acceptance. No prompt is sent.",
         {"thread_id": id_field, "action": {"type": "string", "enum": ["offer", "unlink"]}}, ("thread_id",))
-    add("read_thread", read_thread, "Read bounded public text and state from an explicitly linked chat, only after link acceptance. No raw tool results, reasoning, or wake.",
+    add("read_thread", read_thread, "For independent parent chats: read bounded public text from a linked parent after acceptance. Delegated agents use peer_receive for their own messages. scan_limited_roles reports incomplete scans. No raw tool results, reasoning, or wake.",
         {"thread_id": id_field, "limit": {"type": "integer", "minimum": 1, "maximum": 10}}, ("thread_id",))
-    add("send_message_to_thread", send_message, "Queue an attributed note to an explicitly linked chat without waking it. A queued note is not a new task or delivery receipt.",
+    add("send_message_to_thread", send_message, "Queue an attributed note to an exact session in your team or a directly linked parent's team. Parent and delegated recipients use peer_receive. A queued note is not a new task, read receipt, or wake.",
         {"thread_id": id_field, "message": {"type": "string", "maxLength": mailbox.MAX_MESSAGE_CHARS}, "in_reply_to": {"type": "string"}}, ("thread_id", "message"))
-    add("wait_threads", wait_threads, "Wait up to 30 seconds for a saved final answer from any linked thread newer than the supplied cursor. Does not launch or resume anyone.",
+    add("wait_threads", wait_threads, "For independent parent chats: wait up to 30 seconds for a linked parent's saved final newer than the cursor. Use peer_receive(wait_seconds=...) for replies to your own messages. scan_limit reports an incomplete search. Does not launch or resume anyone.",
         {"threads": {"type": "array", "minItems": 1, "maxItems": 5, "items": {"type": "object", "properties": {
             "thread_id": id_field, "after_row_id": {"type": "integer", "minimum": 0}}, "required": ["thread_id"], "additionalProperties": False}},
          "wait_seconds": {"type": "number", "minimum": 0, "maximum": 30}}, ("threads",))

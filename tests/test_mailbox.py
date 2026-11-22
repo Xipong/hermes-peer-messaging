@@ -21,6 +21,24 @@ def _send_worker(args):
         return None
 
 
+def _contended_worker(inbox, operation, key, ready, done, result):
+    inbox = Path(inbox)
+    ready.set()
+    try:
+        if operation == "send":
+            _send(inbox, "must not be queued while busy")
+        elif operation == "read":
+            box.read_pending([inbox])
+        else:
+            box.acknowledge([inbox], [key])
+    except Exception as exc:
+        result.put((type(exc).__name__, str(exc)))
+    else:
+        result.put((None, None))
+    finally:
+        done.set()
+
+
 def _send(inbox, text="contract changed", **kwargs):
     return box.enqueue(inbox, sender="sender", target="recipient", text=text, **kwargs)
 
@@ -109,6 +127,49 @@ def test_concurrent_processes_cannot_overfill_or_overwrite(tmp_path):
         ids = [key for key in pool.map(_send_worker, jobs) if key is not None]
     assert len(ids) == len(set(ids)) == box.MAX_PENDING_MESSAGES
     assert box.read_pending([tmp_path])["pending_count"] == box.MAX_PENDING_MESSAGES
+
+
+@pytest.mark.parametrize("operation", ["send", "read", "ack"])
+def test_contended_mailbox_returns_for_retry_without_consuming_mail(tmp_path, operation):
+    item = _send(tmp_path)
+    context = multiprocessing.get_context("spawn")
+    ready, done, result = context.Event(), context.Event(), context.Queue()
+    process = context.Process(target=_contended_worker,
+                              args=(str(tmp_path), operation, item["message_id"], ready, done, result))
+    with box._FileLock(tmp_path / ".lock"):
+        process.start()
+        try:
+            assert ready.wait(10), "mailbox worker did not start"
+            assert done.wait(8), "mailbox operation blocked on a lock instead of returning for retry"
+            error, message = result.get(timeout=2)
+            assert error == "TimeoutError", (error, message)
+            assert "retry" in message.lower()
+            process.join(timeout=5)
+            assert process.exitcode == 0
+        finally:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
+            result.close()
+            result.join_thread()
+    assert box.read_pending([tmp_path])["messages"] == [item]
+
+
+def test_invalid_unicode_is_rejected_before_inbox_creation(tmp_path):
+    inbox = tmp_path / "absent"
+    # Hermes' atomic writer ASCII-escapes the entire JSON on lone surrogates;
+    # this otherwise accepted text became a >64KB file deleted on first read.
+    text = "\udcff" + "😀" * (box.MAX_MESSAGE_CHARS - 1)
+    with pytest.raises(ValueError, match="UTF-8"):
+        _send(inbox, text)
+    assert not inbox.exists()
+
+
+@pytest.mark.parametrize("character", ["😀", "\x00"])
+def test_maximum_valid_unicode_and_json_escapes_remain_readable(tmp_path, character):
+    item = _send(tmp_path, character * box.MAX_MESSAGE_CHARS)
+    assert box.read_pending([tmp_path])["messages"] == [item]
+    assert (tmp_path / f"{item['message_id']}.json").exists()
 
 
 def test_storage_projects_only_data_not_attacker_role(tmp_path):

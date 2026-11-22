@@ -12,6 +12,7 @@ import math
 import re
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,18 @@ MAX_READ_MESSAGES = 5
 _MESSAGE_ID = re.compile(r"[0-9]{20}_[0-9a-f]{8}")
 _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 MAX_ENVELOPE_BYTES = 64_000
+
+
+@contextmanager
+def _locked(inbox: Path):
+    # A stalled peer must not turn a bounded inbox poll into an indefinite wait.
+    try:
+        with _FileLock(inbox / ".lock", timeout=2.0):
+            yield
+    except RuntimeError as exc:
+        if isinstance(exc.__cause__, BlockingIOError):
+            raise TimeoutError("Peer inbox is busy; retry the operation") from exc
+        raise
 
 
 def session_component(value: str) -> str:
@@ -93,12 +106,19 @@ def enqueue(inbox: Path, *, sender: str, target: str, text: str,
     session_component(target)
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_MESSAGE_CHARS:
         raise ValueError(f"message must contain 1–{MAX_MESSAGE_CHARS} characters")
+    # Lone surrogates trigger the host writer's whole-envelope ASCII fallback,
+    # which can exceed the read cap despite the character limit. Reject before
+    # publication instead of accepting a message the reader would discard.
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("message must contain valid UTF-8 text") from exc
     if in_reply_to is not None:
         message_id(in_reply_to)
     if inbox.is_symlink():
         raise ValueError("Peer inbox must not be a symlink")
     inbox.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with _FileLock(inbox / ".lock"):
+    with _locked(inbox):
         if len(_paths(inbox)) >= MAX_PENDING_MESSAGES:
             raise ValueError("Target inbox is full; its recipient must read and acknowledge messages")
         key = f"{time.time_ns():020d}_{uuid.uuid4().hex[:8]}"
@@ -125,7 +145,7 @@ def read_pending(inboxes: list[Path], *, limit: int = MAX_READ_MESSAGES) -> dict
             continue
         if inbox.is_symlink():
             raise ValueError("Peer inbox must not be a symlink")
-        with _FileLock(inbox / ".lock"):
+        with _locked(inbox):
             for path in _paths(inbox):
                 try:
                     entry = _load(path)
@@ -153,7 +173,7 @@ def acknowledge(inboxes: list[Path], ids: list[str]) -> dict[str, Any]:
             continue
         if inbox.is_symlink():
             raise ValueError("Peer inbox must not be a symlink")
-        with _FileLock(inbox / ".lock"):
+        with _locked(inbox):
             for key in wanted:
                 path = inbox / f"{key}.json"
                 try:
