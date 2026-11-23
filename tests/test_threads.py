@@ -24,12 +24,14 @@ def append(home, sid, role, content, **fields):
 def connect():
     assert ok("link_thread", "sender", thread_id="recipient")["status"] == "awaiting_other_chat"
     assert ok("list_threads", "recipient")["threads"][0]["link"] == "incoming"
-    assert ok("link_thread", "recipient", thread_id="sender")["status"] == "linked"
+    result = ok("link_thread", "recipient", thread_id="sender")
+    assert result["status"] == "linked" and result["transcript_shared"] is True
 
 
 def test_consent_is_bilateral_scoped_and_revocable(install):
     assert ok("list_threads", "sender")["threads"] == []
-    assert not call("link_thread", "sender", thread_id="elsewhere")["success"]
+    assert not call("link_thread", "sender", thread_id="foreign")["success"]
+    assert not call("link_thread", "sender", thread_id="managed")["success"]
     append(install, "recipient", "assistant", "private pre-link note", timestamp=time.time() - 20, finish_reason="stop")
     assert not call("read_thread", "sender", thread_id="recipient")["success"]
     connect()

@@ -50,7 +50,9 @@ def test_nested_named_project_takes_precedence_over_shared_git_root(install):
     assert "recipient" not in {p["session_id"] for p in call("peer_sessions", "sender")["peers"]}
     # First contact parent-to-parent remains permitted, but it does not grant team access.
     assert call("peer_send", "sender", target_session_id="recipient", message="heads up")["status"] == "queued"
-    assert not call("link_thread", "sender", thread_id="recipient")["success"]
+    assert call("link_thread", "sender", thread_id="recipient")["status"] == "awaiting_other_chat"
+    link = call("link_thread", "recipient", thread_id="sender")
+    assert link["status"] == "linked" and link["transcript_shared"] is False
 
 
 def test_active_project_pointer_and_pathless_project_do_not_claim_unrelated_chat(install):

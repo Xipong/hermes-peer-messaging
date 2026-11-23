@@ -111,6 +111,45 @@ def test_same_team_cross_batch_and_nested_messages_keep_separate_inboxes(teams):
     assert ok("peer_receive", "b2")["messages"][0]["message_id"] == cross["message_id"]
 
 
+def test_cross_project_parent_consent_enables_only_peer_mail(install):
+    from test_awareness import pin, start
+    from test_hermes_projects import project
+
+    with open_persistence(profile_scope(home=install)) as store:
+        add_child(store, "api-child", "sender")
+        add_child(store, "other-child", "elsewhere", cwd="/other/work", git_root="/other")
+    args = {"target_session_id": "other-child", "message": "Cross-project coordination"}
+    assert not call("peer_send", "api-child", **args)["success"]
+    pin(install, "elsewhere")
+    assert ok("link_thread", "sender", thread_id="elsewhere")["status"] == "awaiting_other_chat"
+    assert "list_threads" in start("elsewhere", "incoming", platform="tui")
+    offer, = ok("list_threads", "elsewhere")["threads"]
+    assert offer["thread_id"] == "sender" and offer["link"] == "incoming"
+    assert "other-child" not in peers("api-child", same_project=False)
+    assert not call("peer_send", "api-child", **args)["success"]
+
+    accepted = ok("link_thread", "elsewhere", thread_id="sender")
+    assert accepted["status"] == "linked" and accepted["transcript_shared"] is False
+    assert "other-child" not in peers("api-child")
+    assert "other-child" in peers("api-child", same_project=False)
+    sent = ok("peer_send", "api-child", **args)
+    assert ok("peer_receive", "other-child")["messages"][0]["message_id"] == sent["message_id"]
+    reply = ok("peer_send", "other-child", target_session_id="api-child", message="Received",
+               in_reply_to=sent["message_id"])
+    assert ok("peer_receive", "api-child")["messages"][0]["message_id"] == reply["message_id"]
+    assert not call("read_thread", "sender", thread_id="elsewhere")["success"]
+    assert not call("wait_threads", "sender", threads=[{"thread_id": "elsewhere"}], wait_seconds=0)["success"]
+
+    # Changing project membership must not turn a mail-only link into consent to share text.
+    project(install, "Combined project", "/project", "/other")
+    assert "other-child" in peers("api-child")
+    assert not call("read_thread", "sender", thread_id="elsewhere")["success"]
+    assert not call("wait_threads", "sender", threads=[{"thread_id": "elsewhere"}], wait_seconds=0)["success"]
+    assert ok("list_threads", "sender")["threads"][0]["transcript_shared"] is False
+    ok("link_thread", "sender", thread_id="elsewhere", action="unlink")
+    assert not call("peer_send", "api-child", **args)["success"]
+
+
 def test_pathless_team_discovers_other_batches_and_parent_without_project(install):
     from persistence.conversation.sessions import SessionId
     from test_awareness import pin, start, tool
