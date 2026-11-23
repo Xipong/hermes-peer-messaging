@@ -161,6 +161,10 @@ def allowed(a, b, links, *, require_link=False, project_index=None) -> bool:
         return True
     if not (require_link or a.is_child or b.is_child):
         return True
+    if project_index is None:
+        from .project_identity import ProjectIndex
+
+        project_index = ProjectIndex()
     project = service.project(a.root, index=project_index)
     if not project or project != service.project(b.root, index=project_index):
         return False
