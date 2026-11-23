@@ -76,7 +76,12 @@ def pair(own, other):
 
 
 def project_pair(a, b):
-    if not service.same_profile(a.profile_name, b.profile_name) or not service.project(a) or service.project(a) != service.project(b):
+    from .project_identity import ProjectIndex
+
+    index = ProjectIndex(get_hermes_home())
+    a_project = service.project(a, index=index)
+    if (not service.same_profile(a.profile_name, b.profile_name) or not a_project
+            or a_project != service.project(b, index=index)):
         raise ValueError("Thread links require local conversations in the same profile and project")
 
 

@@ -152,7 +152,7 @@ def resolve(store, sid, *, follow=True, allow_ended=False) -> Participant:
     return resolver.child(row, follow=follow) if _child(row) else resolver.local(row, follow=follow)
 
 
-def allowed(a, b, links, *, require_link=False) -> bool:
+def allowed(a, b, links, *, require_link=False, project_index=None) -> bool:
     from . import service
 
     if not service.same_profile(a.root.profile_name, b.root.profile_name):
@@ -161,8 +161,8 @@ def allowed(a, b, links, *, require_link=False) -> bool:
         return True
     if not (require_link or a.is_child or b.is_child):
         return True
-    project = service.project(a.root)
-    if not project or project != service.project(b.root):
+    project = service.project(a.root, index=project_index)
+    if not project or project != service.project(b.root, index=project_index):
         return False
     key = ":".join(sorted((a.root_id, b.root_id)))
     edge = links.get(key)

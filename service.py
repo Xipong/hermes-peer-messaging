@@ -99,9 +99,15 @@ def receive_scope(home, sid, *, patience_s=None):
         return own.row, [inbox / item for item in own.inbox_ids]
 
 
-def project(row):
-    p = row.git_repo_root or row.cwd
-    return os.path.normcase(str(Path(p).expanduser().resolve())) if p and p.strip() else None
+def project(row, *, index=None):
+    """Prefer an explicit Hermes Project ID; preserve a path fallback for unassigned chats.
+
+    Native Projects have several folders but are not written as project_id in
+    session rows. Never infer membership from the profile's active-project pointer.
+    """
+    from .project_identity import ProjectIndex
+
+    return (index if index is not None else ProjectIndex(get_hermes_home())).key(row)
 
 
 def owners(home):
@@ -114,11 +120,13 @@ def owners(home):
         return None
 
 
-def discover(store, own, links, *, cutoff, same=True):
+def discover(store, own, links, *, cutoff, same=True, index=None):
     """Separate bounded scans keep busy subagent trees from hiding local parents."""
     from . import teams
+    from .project_identity import ProjectIndex
 
-    key = project(own.root) if same else None
+    index = index if index is not None else ProjectIndex(get_hermes_home())
+    key = project(own.root, index=index) if same else None
     if same and key is None:
         raise ValueError("This chat has no project path; use same_project=false")
     peers, seen, limited = [], {own.row.session_id}, []
@@ -141,16 +149,17 @@ def discover(store, own, links, *, cutoff, same=True):
                 continue
             row = participant.row
             target = row.session_id
-            if target in seen or not teams.allowed(own, participant, links):
+            if target in seen or not teams.allowed(own, participant, links, project_index=index):
                 continue
             seen.add(target)
             stamps = [row.started_at, row.last_activity_at, store.sessions.last_active(target)]
             if target == candidate:
                 stamps.append(entry.last_active)
             active = max((v for v in stamps if isinstance(v, (int, float)) and math.isfinite(v)), default=0)
-            if active < cutoff or (same and project(participant.root) != key):
+            if active < cutoff or (same and project(participant.root, index=index) != key):
                 continue
-            peers.append({**teams.describe(participant), "cwd": row.cwd,
+            peers.append({**teams.describe(participant), "hermes_project_id": index.named_id(participant.root),
+                          "cwd": row.cwd,
                           "git_repo_root": row.git_repo_root, "last_active": active,
                           "last_activity_description": row.last_activity_description})
     peers.sort(key=lambda peer: peer["last_active"], reverse=True)
@@ -164,13 +173,16 @@ def sessions(args, sid):
     if type(minutes) is not int or not 1 <= minutes <= 1440 or type(same) is not bool:
         raise ValueError("active_within_minutes must be 1–1440 and same_project must be boolean")
     home, cutoff = get_hermes_home(), time.time() - minutes * 60
+    from .project_identity import ProjectIndex
+    index = ProjectIndex(home)
     with threads.graph(home) as links, open_persistence_reader(home) as store:
         own = teams.resolve(store, sid)
-        peers, limited = discover(store, own, links, cutoff=cutoff, same=same)
+        peers, limited = discover(store, own, links, cutoff=cutoff, same=same, index=index)
     live = owners(home) if peers else None
     for peer in peers:
         peer["owner_present"] = None if live is None else peer["session_id"] in live
-    return {"success": True, **teams.describe(own), "count": len(peers), "peers": peers,
+    return {"success": True, **teams.describe(own), "hermes_project_id": index.named_id(own.root),
+            "count": len(peers), "peers": peers,
             "same_project": same, "scan_limit": 2 * SCAN_LIMIT, "scan_limit_per_source": SCAN_LIMIT,
             "scan_may_be_truncated": bool(limited), "scan_limited_sources": limited,
             "note": "Includes this team's children and teams of directly linked local chats. "
@@ -294,12 +306,15 @@ class InboxNotices:
                                 continue
                             incoming.add(other_id)
                         notices["_peer_link_notice"] = (frozenset(incoming), LINK_HINT)
-                    if (project(own.root) and pin_has_tool(own.row.tool_pin, "peer_sessions")
+                    if (pin_has_tool(own.row.tool_pin, "peer_sessions")
                             and self._discovery_due(key, force=force_discovery)):
-                        peers, _ = discover(store, own, links, cutoff=time.time() - 3600)
-                        notices["_peer_discovery_notice"] = (
-                            frozenset(peer["session_id"] for peer in peers), DISCOVERY_HINT,
-                        )
+                        from .project_identity import ProjectIndex
+                        index = ProjectIndex(home)
+                        if project(own.root, index=index):
+                            peers, _ = discover(store, own, links, cutoff=time.time() - 3600, index=index)
+                            notices["_peer_discovery_notice"] = (
+                                frozenset(peer["session_id"] for peer in peers), DISCOVERY_HINT,
+                            )
         except Exception:
             LOG.debug("Peer awareness snapshot unavailable; mail and links are untouched", exc_info=True)
         if self.sibling_notices is not None:
