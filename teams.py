@@ -152,26 +152,16 @@ def resolve(store, sid, *, follow=True, allow_ended=False) -> Participant:
     return resolver.child(row, follow=follow) if _child(row) else resolver.local(row, follow=follow)
 
 
-def allowed(a, b, links, *, require_link=False, project_index=None) -> bool:
-    from . import service
+def allowed(a, b, links) -> bool:
+    from . import service, threads
 
     if not service.same_profile(a.root.profile_name, b.root.profile_name):
         return False
     if a.root_id == b.root_id:
         return True
-    if not (require_link or a.is_child or b.is_child):
+    if not (a.is_child or b.is_child):
         return True
-    if project_index is None:
-        from .project_identity import ProjectIndex
-
-        project_index = ProjectIndex()
-    project = service.project(a.root, index=project_index)
-    if not project or project != service.project(b.root, index=project_index):
-        return False
-    key = ":".join(sorted((a.root_id, b.root_id)))
-    edge = links.get(key)
-    return bool(isinstance(edge, dict) and edge.get("since") is not None
-                and set(edge.get("offers", ())) == {a.root_id, b.root_id})
+    return threads.accepted(links.get(threads.pair(a.root_id, b.root_id)), a.root_id, b.root_id)
 
 
 def describe(participant) -> dict:

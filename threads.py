@@ -9,11 +9,12 @@ from uuid import uuid4
 from hermes_cli.active_sessions import _FileLock
 from hermes_constants import get_hermes_home
 from persistence.conversation.messages import TranscriptRead
-from persistence.conversation.sessions import NewSession, sanitize_title
+from persistence.conversation.sessions import NewSession, SessionId, sanitize_title
 from persistence_assembly import open_persistence, open_persistence_reader, profile_scope
 from utils import atomic_json_write
 
 from . import mailbox, service
+from .project_identity import ProjectIndex
 
 _MAX_LINKS = 1024
 _MAX_PEERS = 32
@@ -75,14 +76,21 @@ def pair(own, other):
     return ":".join(sorted((own, other)))
 
 
-def project_pair(a, b):
-    from .project_identity import ProjectIndex
-
-    index = ProjectIndex(get_hermes_home())
+def same_project(a, b, *, index=None):
+    index = index if index is not None else ProjectIndex(get_hermes_home())
     a_project = service.project(a, index=index)
-    if (not service.same_profile(a.profile_name, b.profile_name) or not a_project
-            or a_project != service.project(b, index=index)):
-        raise ValueError("Thread links require local conversations in the same profile and project")
+    return a_project is not None and a_project == service.project(b, index=index)
+
+
+def accepted(edge, a, b):
+    return bool(isinstance(edge, dict) and edge.get("since") is not None
+                and set(edge.get("offers", ())) == {a, b})
+
+
+def shares_transcript(edge, own, other, *, index=None):
+    # Legacy links could only be offered in the same project. A mail-only link
+    # must not turn into transcript consent when its participants move.
+    return edge.get("mail_only", False) is False and same_project(own, other, index=index)
 
 
 def neighbors(links, own):
@@ -109,24 +117,28 @@ def link(args, sid):
         raise ValueError("action must be offer or unlink")
     with graph(home, write=True) as links, open_persistence_reader(home) as store:
         own_id, own = locate(store, sid)
-        if action == "unlink" and pair(own_id, requested) in links:
-            other_id = requested  # Revocation still works for an ended or deleted participant.
-        else:
-            other_id, other = locate(store, requested, allow_ended=action == "unlink")
-            if action == "offer":
-                project_pair(own, other)
-        key = pair(own_id, other_id)
         if action == "unlink":
-            links.pop(key, None)
+            # The stable ID can revoke a link even if the other chat is gone.
+            other_id = requested if pair(own_id, requested) in links else locate(store, requested, allow_ended=True)[0]
+            links.pop(pair(own_id, other_id), None)
             return {"success": True, "status": "unlinked", "thread_id": other_id}
+        other_id, other = locate(store, requested)
+        if not service.same_profile(own.profile_name, other.profile_name):
+            raise ValueError("Thread links cannot cross profiles")
         edge = new_edge(links, own_id, other_id)
-        edge["offers"] = sorted({*edge["offers"], own_id})
-        if edge["since"] is None and len(edge["offers"]) == 2:
-            edge["since"] = time.time()
-        status = "linked" if edge["since"] is not None else "awaiting_other_chat"
+        index = ProjectIndex(home)
+        if edge["since"] is None:
+            if not same_project(own, other, index=index):
+                edge["mail_only"] = True
+            edge["offers"] = sorted({*edge["offers"], own_id})
+            if set(edge["offers"]) == {own_id, other_id}:
+                edge["since"] = time.time()
+        is_linked = accepted(edge, own_id, other_id)
+        status = "linked" if is_linked else "awaiting_other_chat"
         return {"success": True, "status": status, "thread_id": other_id,
-                "note": "Both parents must offer the exact link. An eligible recipient can notice an incoming offer "
-                        "during its ordinary turn and inspect list_threads; no chat is started."}
+                "transcript_shared": is_linked and shares_transcript(edge, own, other, index=index),
+                "note": "Both parents must offer the exact link. Once linked, use peer_sessions(same_project=false) "
+                        "to find teammates across projects. Cross-project links grant messaging only; no chat is started."}
 
 
 def describe(key, row):
@@ -143,14 +155,18 @@ def list_threads(args, sid):
         participant = teams.resolve(store, sid)
         own_id, own = participant.root_id, participant.root
         result = []
+        index = ProjectIndex(home)
         for other_id, edge in neighbors(links, own_id):
             try:
                 _, other = locate(store, other_id, allow_ended=True)
-                project_pair(own, other)
             except ValueError:
                 continue
-            state = "linked" if edge["since"] is not None else ("offered" if own_id in edge["offers"] else "incoming")
-            result.append({**describe(other_id, other), "link": state})
+            if not service.same_profile(own.profile_name, other.profile_name):
+                continue
+            is_linked = accepted(edge, own_id, other_id)
+            state = "linked" if is_linked else ("offered" if own_id in edge["offers"] else "incoming")
+            result.append({**describe(other_id, other), "link": state,
+                           "transcript_shared": is_linked and shares_transcript(edge, own, other, index=index)})
         return {"success": True, "thread_id": own_id, "session_id": participant.row.session_id,
                 "root_thread_id": own_id, "threads": result}
 
@@ -158,10 +174,11 @@ def list_threads(args, sid):
 def linked(store, links, own_id, own, target, *, allow_ended=False):
     target = mailbox.session_component(target)
     other_id, row = locate(store, target, allow_ended=allow_ended)
-    project_pair(own, row)
     edge = links.get(pair(own_id, other_id))
-    if not edge or edge["since"] is None:
+    if not service.same_profile(own.profile_name, row.profile_name) or not accepted(edge, own_id, other_id):
         raise ValueError("This thread has not accepted the link. Use link_thread from both chats first.")
+    if not shares_transcript(edge, own, row):
+        raise ValueError("This link does not share transcripts. Use peer_send for coordination.")
     return other_id, row, edge["since"]
 
 
@@ -239,10 +256,6 @@ def read_thread(args, sid):
                 "note": "Public text from the current segment after link acceptance. scan_limited_roles names incomplete scans; not a live turn status."}
 
 
-def send_message(args, sid):
-    return service.send({**args, "target_session_id": args.get("thread_id")}, sid, require_link=True)
-
-
 def wait_threads(args, sid):
     targets = args.get("threads")
     wait = args.get("wait_seconds", 15)
@@ -299,7 +312,7 @@ def create_thread(args, sid):
     if not isinstance(name, str) or not (title := sanitize_title(name)):
         raise ValueError("A non-empty chat title is required")
     home = get_hermes_home()
-    target = f"thread-{uuid4().hex}"
+    target = SessionId(f"thread-{uuid4().hex}")
     with graph(home, write=True) as links, open_persistence(profile_scope(home=home)) as store:
         own_id, own = locate(store, sid)
         if not service.project(own) or not own.cwd:
@@ -307,10 +320,13 @@ def create_thread(args, sid):
         edge = new_edge(links, own_id, target)
         # Do not copy messages, system prompt, runtime policy, secrets, or parent DB lineage.
         # This creates a named local chat record only. A human may open it separately.
-        store.sessions.create_exclusive(target, source=service.surface(own), title=title)
-        store.sessions.create(NewSession(target, service.surface(own), cwd=own.cwd, git_repo_root=own.git_repo_root))
+        source = service.surface(own)
+        assert source is not None  # locate accepted only local surfaces.
+        store.sessions.create_exclusive(target, source=source, title=title)
+        store.sessions.create(NewSession(target, source, cwd=own.cwd, git_repo_root=own.git_repo_root))
         row = store.sessions.get(target)
-        project_pair(own, row)
+        if not same_project(own, row):
+            raise ValueError("New linked chats must belong to the current chat's project")
         edge.update(offers=sorted((own_id, target)), since=time.time())
     return {"success": True, "status": "created_idle", **describe(target, row),
             "note": "Created a new self-contained chat without starting a turn. Open it by title or session ID."}
@@ -324,13 +340,11 @@ def register(ctx):
                               "required": list(required), "additionalProperties": False}})
     id_field = {"type": "string", "description": "Exact thread_id or current session_id"}
     add("list_threads", list_threads, "List your team's directly linked local parent chats and pending offers. Delegated agents inherit their root parent's directory. No wake.", {})
-    add("link_thread", link, "For independent parent chats: propose or revoke a same-project link. Both parents must offer. The link also permits messaging between their delegated teams; it does not extend transitively to other links. Parents share new public text after acceptance. No prompt is sent.",
+    add("link_thread", link, "For independent local parents in one profile: propose or revoke a link between teams. Both must offer; links are not transitive. Linked teams can message each other across projects. Only links formed in the same project can share new public parent text. No prompt is sent.",
         {"thread_id": id_field, "action": {"type": "string", "enum": ["offer", "unlink"]}}, ("thread_id",))
-    add("read_thread", read_thread, "For independent parent chats: read bounded public text from a linked parent after acceptance. Delegated agents use peer_receive for their own messages. scan_limited_roles reports incomplete scans. No raw tool results, reasoning, or wake.",
+    add("read_thread", read_thread, "For independent parents: read bounded public text after a shared-transcript link in the same project. Mail-only links do not grant access. Delegated agents use peer_receive. scan_limited_roles reports incomplete scans. No raw tool results, reasoning, or wake.",
         {"thread_id": id_field, "limit": {"type": "integer", "minimum": 1, "maximum": 10}}, ("thread_id",))
-    add("send_message_to_thread", send_message, "Queue an attributed note to an exact session in your team or a directly linked parent's team. Parent and delegated recipients use peer_receive. A queued note is not a new task, read receipt, or wake.",
-        {"thread_id": id_field, "message": {"type": "string", "maxLength": mailbox.MAX_MESSAGE_CHARS}, "in_reply_to": {"type": "string"}}, ("thread_id", "message"))
-    add("wait_threads", wait_threads, "For independent parent chats: wait up to 30 seconds for a linked parent's saved final newer than the cursor. Use peer_receive(wait_seconds=...) for replies to your own messages. scan_limit reports an incomplete search. Does not launch or resume anyone.",
+    add("wait_threads", wait_threads, "For independent parents: wait up to 30 seconds for a same-project parent's saved final newer than the cursor on a shared-transcript link. Use peer_receive(wait_seconds=...) for mail replies. scan_limit reports an incomplete search. Does not launch or resume anyone.",
         {"threads": {"type": "array", "minItems": 1, "maxItems": 5, "items": {"type": "object", "properties": {
             "thread_id": id_field, "after_row_id": {"type": "integer", "minimum": 0}}, "required": ["thread_id"], "additionalProperties": False}},
          "wait_seconds": {"type": "number", "minimum": 0, "maximum": 30}}, ("threads",))

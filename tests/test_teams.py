@@ -92,7 +92,6 @@ def test_links_grant_direct_teams_only_and_revocation_is_immediate(install):
         assert not teams.allowed(a, b, links)
         parent_a, parent_b = teams.resolve(store, "sender"), teams.resolve(store, "recipient")
         assert teams.allowed(parent_a, parent_b, links)
-        assert not teams.allowed(parent_a, parent_b, links, require_link=True)
 
 
 def test_unverified_or_foreign_parent_edges_never_grant_team_membership(install):

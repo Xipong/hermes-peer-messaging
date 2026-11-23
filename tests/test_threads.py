@@ -24,15 +24,16 @@ def append(home, sid, role, content, **fields):
 def connect():
     assert ok("link_thread", "sender", thread_id="recipient")["status"] == "awaiting_other_chat"
     assert ok("list_threads", "recipient")["threads"][0]["link"] == "incoming"
-    assert ok("link_thread", "recipient", thread_id="sender")["status"] == "linked"
+    result = ok("link_thread", "recipient", thread_id="sender")
+    assert result["status"] == "linked" and result["transcript_shared"] is True
 
 
 def test_consent_is_bilateral_scoped_and_revocable(install):
     assert ok("list_threads", "sender")["threads"] == []
-    assert not call("link_thread", "sender", thread_id="elsewhere")["success"]
+    assert not call("link_thread", "sender", thread_id="foreign")["success"]
+    assert not call("link_thread", "sender", thread_id="managed")["success"]
     append(install, "recipient", "assistant", "private pre-link note", timestamp=time.time() - 20, finish_reason="stop")
     assert not call("read_thread", "sender", thread_id="recipient")["success"]
-    assert not call("send_message_to_thread", "sender", thread_id="recipient", message="not linked")["success"]
     connect()
     assert not call("read_thread", "elsewhere", thread_id="recipient")["success"]
     assert ok("read_thread", "sender", thread_id="recipient")["messages"] == []
@@ -68,7 +69,7 @@ def test_message_and_wait_never_start_a_thread(install):
     connect()
     first = ok("wait_threads", "sender", threads=[{"thread_id": "recipient"}], wait_seconds=0)
     assert first["status"] == "timeout" and first["pending"] == ["recipient"]
-    queued = ok("send_message_to_thread", "sender", thread_id="recipient", message="coordination, not a prompt")
+    queued = ok("peer_send", "sender", target_session_id="recipient", message="coordination, not a prompt")
     assert queued["status"] == "queued"
     with open_persistence_reader(install) as store:
         assert all(store.sessions.get(i).message_count == 0 for i in ("recipient", "elsewhere"))
@@ -84,7 +85,7 @@ def test_message_and_wait_never_start_a_thread(install):
     with open_persistence(profile_scope(home=install)) as store:
         store.sessions.end("recipient", "agent_close")
     assert ok("read_thread", "sender", thread_id="recipient")["ended_at"] is not None
-    assert not call("send_message_to_thread", "sender", thread_id="recipient", message="closed")["success"]
+    assert not call("peer_send", "sender", target_session_id="recipient", message="closed")["success"]
     closed = ok("wait_threads", "sender", threads=[{"thread_id": "recipient", "after_row_id": result["row_id"]}],
                 wait_seconds=0)
     assert closed["status"] == "closed" and closed["closed"] == ["recipient"]
@@ -158,5 +159,5 @@ def test_create_is_explicit_independent_and_idle(install):
         assert store.messages.read_transcript(target) == ()
     assert ok("list_threads", "sender")["threads"][0]["thread_id"] == target
     assert ok("read_thread", "sender", thread_id=target)["messages"] == []
-    assert ok("send_message_to_thread", "sender", thread_id=target, message="for when you open")["status"] == "queued"
+    assert ok("peer_send", "sender", target_session_id=target, message="for when you open")["status"] == "queued"
     assert ok("wait_threads", "sender", threads=[{"thread_id": target}], wait_seconds=0)["status"] == "timeout"
