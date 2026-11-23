@@ -1,5 +1,5 @@
 name: peer-messaging
-version: 0.5.0
+version: 0.6.0
 manifest_version: 2
 api_version: 1
 description: Local Hermes conversations and their delegated teams coordinate through linked threads and durable inboxes without waking idle agents.
@@ -12,11 +12,8 @@ provides_tools:
   - list_threads
   - link_thread
   - read_thread
-  - send_message_to_thread
   - wait_threads
   - create_thread
-  - message_peer
 provides_hooks:
   - pre_llm_call
-  - subagent_start
   - transform_tool_result

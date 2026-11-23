@@ -63,10 +63,19 @@ def test_active_project_pointer_and_pathless_project_do_not_claim_unrelated_chat
     assert "elsewhere" not in {p["session_id"] for p in sender["peers"]}
 
 
-def test_same_running_turn_discovers_new_native_project_peer_on_tool_result(install):
+def test_same_running_turn_discovers_new_native_project_peer_on_tool_result(install, monkeypatch):
     from hermes_cli.lifecycle import invoke_hook
+    from hermes_cli.plugins import iter_hook_callbacks
     from model_tools import handle_function_call
     import json
+    from types import SimpleNamespace
+
+    # Patch the installed package behind the hook, not the test-loader alias.
+    callback = next(cb for cb in iter_hook_callbacks("pre_llm_call")
+                    if cb.__name__ == "before_turn" and cb.__module__.endswith(".service"))
+    service = import_module(callback.__module__)
+    clock = [100.0]
+    monkeypatch.setattr(service, "time", SimpleNamespace(monotonic=lambda: clock[0], time=service.time.time))
 
     project(install, "One project", "/project/api", "/new-repo/web")
     with open_persistence(profile_scope(home=install)) as store:
@@ -76,11 +85,12 @@ def test_same_running_turn_discovers_new_native_project_peer_on_tool_result(inst
     assert not [v for v in invoke_hook("pre_llm_call", session_id="sender",
                                        turn_id="hours-long-turn", platform="cli") if v]
     create(install, "web", "/new-repo/web", "/new-repo")
+    clock[0] += service.DISCOVERY_INTERVAL
     result = json.loads(handle_function_call(
         "list_threads", {}, session_id="sender", turn_id="hours-long-turn",
         tool_call_id="still-same-turn", enabled_toolsets=["peer_messaging"],
     ))
-    assert result["_peer_discovery_notice"] == import_module("peer-messaging.service").DISCOVERY_HINT
+    assert result["_peer_discovery_notice"] == service.DISCOVERY_HINT
     assert call("peer_sessions", "sender")["hermes_project_id"] is not None
     with open_persistence_reader(install) as store:
         assert store.sessions.get("web").api_call_count == 0

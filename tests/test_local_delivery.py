@@ -52,7 +52,10 @@ def call(tool, sid, **args):
 def test_only_local_same_project_and_explicit_cross_project(install):
     from model_tools import get_tool_definitions
     defs = get_tool_definitions(enabled_toolsets=["peer_messaging"], skip_tool_search_assembly=True, quiet_mode=True)
-    assert {tool["function"]["name"] for tool in defs} >= {"peer_sessions", "peer_send", "peer_receive"}
+    assert {tool["function"]["name"] for tool in defs} == {
+        "peer_sessions", "peer_send", "peer_receive", "list_threads", "link_thread",
+        "read_thread", "wait_threads", "create_thread",
+    }
     assert [p["session_id"] for p in call("peer_sessions", "sender")["peers"]] == ["recipient"]
     assert {p["session_id"] for p in call("peer_sessions", "sender", same_project=False)["peers"]} == {"recipient", "elsewhere"}
     for refused in ("managed", "foreign", "delegate", "sender", "../recipient"):

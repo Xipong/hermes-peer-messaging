@@ -239,10 +239,6 @@ def read_thread(args, sid):
                 "note": "Public text from the current segment after link acceptance. scan_limited_roles names incomplete scans; not a live turn status."}
 
 
-def send_message(args, sid):
-    return service.send({**args, "target_session_id": args.get("thread_id")}, sid, require_link=True)
-
-
 def wait_threads(args, sid):
     targets = args.get("threads")
     wait = args.get("wait_seconds", 15)
@@ -328,8 +324,6 @@ def register(ctx):
         {"thread_id": id_field, "action": {"type": "string", "enum": ["offer", "unlink"]}}, ("thread_id",))
     add("read_thread", read_thread, "For independent parent chats: read bounded public text from a linked parent after acceptance. Delegated agents use peer_receive for their own messages. scan_limited_roles reports incomplete scans. No raw tool results, reasoning, or wake.",
         {"thread_id": id_field, "limit": {"type": "integer", "minimum": 1, "maximum": 10}}, ("thread_id",))
-    add("send_message_to_thread", send_message, "Queue an attributed note to an exact session in your team or a directly linked parent's team. Parent and delegated recipients use peer_receive. A queued note is not a new task, read receipt, or wake.",
-        {"thread_id": id_field, "message": {"type": "string", "maxLength": mailbox.MAX_MESSAGE_CHARS}, "in_reply_to": {"type": "string"}}, ("thread_id", "message"))
     add("wait_threads", wait_threads, "For independent parent chats: wait up to 30 seconds for a linked parent's saved final newer than the cursor. Use peer_receive(wait_seconds=...) for replies to your own messages. scan_limit reports an incomplete search. Does not launch or resume anyone.",
         {"threads": {"type": "array", "minItems": 1, "maxItems": 5, "items": {"type": "object", "properties": {
             "thread_id": id_field, "after_row_id": {"type": "integer", "minimum": 0}}, "required": ["thread_id"], "additionalProperties": False}},

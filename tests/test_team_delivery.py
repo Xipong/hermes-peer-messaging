@@ -19,7 +19,7 @@ def ok(tool, sid, **args):
     return reply
 
 
-def add_child(store, sid, parent, *, profile=None, cwd="/project/work", git_root="/project"):
+def add_child(store, sid, parent, *, profile=None, cwd="/project/work", git_root: str | None = "/project"):
     store.sessions.create(NewSession(
         sid, "subagent", parent_session_id=parent, cwd=cwd, git_repo_root=git_root,
         model_config={"_delegate_from": parent, "_subagent_id": "task-" + sid},
@@ -79,7 +79,7 @@ def test_discovery_and_cross_team_messages_require_both_parent_links(teams):
     reported = ok("peer_send", "b1", target_session_id="recipient", message="Other team owns parser.py",
                   in_reply_to=first["message_id"])
     assert ok("peer_receive", "recipient")["messages"][0]["message_id"] == reported["message_id"]
-    response = ok("send_message_to_thread", "recipient", thread_id="a1", message="Our team will handle the tests",
+    response = ok("peer_send", "recipient", target_session_id="a1", message="Our team will handle the tests",
                   in_reply_to=reported["message_id"])
     answer = ok("peer_receive", "a1")["messages"][0]
     assert answer["message_id"] == response["message_id"]
@@ -107,8 +107,31 @@ def test_same_team_cross_batch_and_nested_messages_keep_separate_inboxes(teams):
     assert ok("peer_receive", "a1", action="ack", message_ids=[parent_note["message_id"]])["acknowledged"] == []
     assert ok("peer_receive", "a-deep")["messages"][0]["message_id"] == parent_note["message_id"]
     link_roots()
-    cross = ok("send_message_to_thread", "a-deep", thread_id="b2", message="Nested cross-team finding")
+    cross = ok("peer_send", "a-deep", target_session_id="b2", message="Nested cross-team finding")
     assert ok("peer_receive", "b2")["messages"][0]["message_id"] == cross["message_id"]
+
+
+def test_pathless_team_discovers_other_batches_and_parent_without_project(install):
+    from persistence.conversation.sessions import SessionId
+    from test_awareness import pin, start, tool
+
+    with open_persistence(profile_scope(home=install)) as store:
+        store.sessions.create(NewSession(SessionId("root"), "desktop"))
+        add_child(store, "batch-one", "root")
+        add_child(store, "batch-two", "root", cwd="/another-worktree", git_root=None)
+    pin(install, "batch-two")
+    assert "across batches" in start("batch-two", "child-turn", platform="subagent", parent="root")
+    found = peers("batch-one")
+    assert set(found) == {"root", "batch-two"}
+    assert found["batch-two"]["root_thread_id"] == "root"
+    sent = ok("peer_send", "batch-one", target_session_id=found["batch-two"]["session_id"], message="Across calls")
+    notice = tool("batch-two", "child-turn")
+    assert "_peer_inbox_notice" in notice and "Across calls" not in json.dumps(notice)
+    received = ok("peer_receive", "batch-two")
+    assert received["authority"] == "peer_data"
+    assert received["messages"][0]["message_id"] == sent["message_id"]
+    reply = ok("peer_send", "root", target_session_id="batch-one", message="Parent can reply too")
+    assert ok("peer_receive", "batch-one")["messages"][0]["message_id"] == reply["message_id"]
 
 
 def test_unlink_revokes_child_access_without_destroying_already_queued_mail(teams):
@@ -116,9 +139,8 @@ def test_unlink_revokes_child_access_without_destroying_already_queued_mail(team
     accepted = ok("peer_send", "a1", target_session_id="b1", message="Accepted while linked")
     ok("link_thread", "recipient", thread_id="sender", action="unlink")
     assert set(peers("a1")) == {"sender", "a2"}
-    for tool, field in (("peer_send", "target_session_id"), ("send_message_to_thread", "thread_id")):
-        assert not call(tool, "a1", **{field: "b1", "message": "after unlink"})["success"]
-        assert not call(tool, "b1", **{field: "sender", "message": "after unlink"})["success"]
+    assert not call("peer_send", "a1", target_session_id="b1", message="after unlink")["success"]
+    assert not call("peer_send", "b1", target_session_id="sender", message="after unlink")["success"]
     assert ok("peer_receive", "b1")["messages"][0]["message_id"] == accepted["message_id"]
     assert ok("peer_receive", "b1", action="ack", message_ids=[accepted["message_id"]])["acknowledged"] == [accepted["message_id"]]
     assert ok("peer_send", "a1", target_session_id="a2", message="Own team still reachable")["status"] == "queued"
@@ -150,7 +172,6 @@ def test_branched_root_and_its_children_do_not_inherit_team_links(teams):
     assert ok("peer_sessions", "branched-child")["root_thread_id"] == "branched-root"
     assert set(peers("branched-child")) == {"branched-root"}
     assert ok("list_threads", "branched-root")["threads"] == []
-    assert not call("send_message_to_thread", "branched-root", thread_id="recipient", message="no inherited link")["success"]
     assert not call("peer_send", "branched-child", target_session_id="b1", message="no inherited link")["success"]
     assert not call("peer_send", "a1", target_session_id="branched-child", message="separate root")["success"]
 
