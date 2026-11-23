@@ -7,6 +7,8 @@ subagent/session ID. The host's private registry is a read-only liveness gate.
 Receive is explicit: queue_plugin_notice can fall back to a later *user* row,
 so it is not a safe carrier for peer payloads. This channel never injects a
 message, wakes a chat, starts a turn, changes schemas, or reads a transcript.
+Content-free roster and pending-message snapshots let the common notification
+hook announce availability during an already running turn.
 Notes remain in the live recipient's inbox until an explicit ACK, so a dropped
 or transformed tool result can be read again. The inbox still dies with the run.
 """
@@ -24,6 +26,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from agent.delegation_context import is_delegated_child_context
+from agent.plugin_session_fork import current_turn_origin
 from gateway.session_context import get_session_env
 from hermes_constants import get_hermes_home, hermes_home_key
 
@@ -42,6 +45,15 @@ _MAX_MESSAGE_JSON_CHARS = 6200
 _MAX_PAGE_JSON_CHARS = 7200
 _ESCAPE_MARKUP = str.maketrans({"<": "\\u003c", ">": "\\u003e"})
 _MESSAGE_ID = re.compile(r"[0-9a-f]{32}")
+_PENDING_NOTICE = (
+    'Pending same-call sibling messages. Use message_peer(action="receive") to read them; '
+    'after handling, acknowledge their message_ids with message_peer(action="ack", message_ids=[...]). '
+    'This notice does not read or acknowledge messages.'
+)
+_ROSTER_NOTICE = (
+    'Live siblings from this delegate_task call are available. Use message_peer(action="list") '
+    'for their exact subagent IDs. Sending queues a message without waking a sibling.'
+)
 
 LOG = logging.getLogger(__name__)
 # Private adapter, verified on Hermes bf045feb13a. Fingerprint the files that
@@ -116,7 +128,21 @@ def _profile():
 
 def _child_context(session_id):
     return (is_delegated_child_context()
-            and get_session_env("HERMES_SESSION_ID", "") == session_id)
+            and get_session_env("HERMES_SESSION_ID", "") == session_id
+            and not current_turn_origin())
+
+
+def _has_tool(agent):
+    names = getattr(agent, "valid_tool_names", None) or ()
+    if TOOL_NAME in names:
+        return True
+    # Plugin tools are normally deferred behind Tool Search. Its explicit
+    # frozen catalog proves this child's grant; the global registry does not.
+    if "tool_search" not in names or "tool_call" not in names:
+        return False
+    from .service import pin_has_tool
+
+    return pin_has_tool(getattr(agent, "tools", None), TOOL_NAME)
 
 
 def _encode(data):
@@ -184,14 +210,16 @@ class _Channel:
                     self.candidates.pop(next(iter(self.candidates)))
 
     def _live(self, sid):
-        """Registry lock held. Require the child's actual grant and profile."""
+        """Registry lock held. Require the child's active turn, grant and profile."""
         record = self.host._active_subagents.get(sid)
         if not record or record.get("status") != "running" or record.get("accepting_steer") is not True:
             return None
         agent = record.get("agent")
         if (agent is None or getattr(agent, "_subagent_id", None) != sid
                 or getattr(agent, "platform", None) != "subagent"
-                or TOOL_NAME not in (getattr(agent, "valid_tool_names", None) or ())
+                or not _has_tool(agent)
+                or not _id(getattr(agent, "_current_turn_id", None))
+                or getattr(agent, "_inflight_turn_id", None) != agent._current_turn_id
                 or getattr(agent, "_interrupt_requested", False)
                 or getattr(agent, "_delegate_stop_requested", False)):
             return None
@@ -212,6 +240,31 @@ class _Channel:
             if (agent is not None and agent.session_id == session_id
                     and getattr(agent, "_parent_session_id", None) == batch.parent_session_id):
                 self.members[agent] = _Member(batch)
+
+    def notices(self, *, session_id="", task_id="", turn_id="", **kwargs):
+        """Return a pure, payload-free snapshot for the shared notice carrier.
+
+        The caller deduplicates these tokens within the turn. Repeated snapshots
+        neither consume inbox entries nor change membership or liveness.
+        """
+        if (self.host is None or not all(map(_id, (session_id, task_id, turn_id)))
+                or not _child_context(session_id) or _profile() != self.home):
+            return {}
+        with self.lock, self.host._active_subagents_lock:
+            caller = self._live(task_id)
+            if (caller is None or caller.session_id != session_id or caller not in self.members
+                    or caller._current_turn_id != turn_id):
+                return {}
+            member = self.members[caller]
+            notes = {}
+            pending = frozenset(note["message_id"] for note in member.inbox)
+            if pending:
+                notes["_peer_sibling_notice"] = (pending, _PENDING_NOTICE)
+            peers = frozenset(sid for sid in self.host._active_subagents
+                              if self._sibling(sid, task_id, member) is not None)
+            if peers:
+                notes["_peer_siblings_notice"] = (peers, _ROSTER_NOTICE)
+            return notes
 
     def _operate(self, args, session_id, task_id):
         identity = self.calling.get()
@@ -257,7 +310,7 @@ class _Channel:
         if sid == caller_id:
             return None
         agent = self._live(sid)
-        if agent is None or not _id(getattr(agent, "_active_turn_id", None)):
+        if agent is None:
             return None
         other = self.members.get(agent)
         return other if other is not None and other.batch is member.batch else None
@@ -311,3 +364,4 @@ def register(ctx):
     ctx.register_middleware(MIDDLEWARE, channel.wrap)
     ctx.register_hook("subagent_start", channel.started)
     ctx.register_hook("pre_llm_call", channel.turn_start)
+    return channel

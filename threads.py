@@ -76,7 +76,12 @@ def pair(own, other):
 
 
 def project_pair(a, b):
-    if not service.same_profile(a.profile_name, b.profile_name) or not service.project(a) or service.project(a) != service.project(b):
+    from .project_identity import ProjectIndex
+
+    index = ProjectIndex(get_hermes_home())
+    a_project = service.project(a, index=index)
+    if (not service.same_profile(a.profile_name, b.profile_name) or not a_project
+            or a_project != service.project(b, index=index)):
         raise ValueError("Thread links require local conversations in the same profile and project")
 
 
@@ -120,7 +125,8 @@ def link(args, sid):
             edge["since"] = time.time()
         status = "linked" if edge["since"] is not None else "awaiting_other_chat"
         return {"success": True, "status": status, "thread_id": other_id,
-                "note": "Both chats must offer the exact link. Linking never sends a prompt or wakes a chat."}
+                "note": "Both parents must offer the exact link. An eligible recipient can notice an incoming offer "
+                        "during its ordinary turn and inspect list_threads; no chat is started."}
 
 
 def describe(key, row):

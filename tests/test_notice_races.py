@@ -1,0 +1,98 @@
+"""A delivery between an operation and its result hook must remain discoverable."""
+import json
+from importlib import import_module
+
+from persistence.conversation.sessions import NewSession
+from persistence_assembly import open_persistence, open_persistence_reader, profile_scope
+
+from test_local_delivery import call, install  # noqa: F401
+
+
+def tracker(home, *tools):
+    with open_persistence(profile_scope(home=home)) as store:
+        store.sessions.update_tool_pin("recipient", {
+            "tools": [{"function": {"name": name}} for name in tools],
+        })
+    return import_module("peer-messaging.service").InboxNotices()
+
+
+def finish(notices, tool_name, result, args=None):
+    return notices.after_tool(
+        tool_name=tool_name, result=json.dumps(result), args=args or {},
+        session_id="recipient", turn_id="same-running-turn",
+    )
+
+
+def test_mail_arriving_after_read_is_not_marked_as_already_inspected(install):
+    service = import_module("peer-messaging.service")
+    notices = tracker(install, "peer_receive")
+    first = call("peer_send", "sender", target_session_id="recipient", message="first note")
+    read = service.receive({}, "recipient")
+    assert [item["message_id"] for item in read["messages"]] == [first["message_id"]]
+
+    # This models the dispatcher finishing the read before its transform hook runs.
+    late = call("peer_send", "sender", target_session_id="recipient", message="late private note")
+    carried = json.loads(finish(notices, "peer_receive", read))
+    assert "peer_receive" in carried["_peer_inbox_notice"]
+    assert carried["messages"] == read["messages"]
+    assert "late private note" not in json.dumps(carried)
+    assert finish(notices, "other_tool", {"value": 1}) is None
+    assert {item["message_id"] for item in service.receive({}, "recipient")["messages"]} == {
+        first["message_id"], late["message_id"],
+    }
+
+
+def test_mail_arriving_after_ack_still_announces_itself_in_the_same_turn(install):
+    service = import_module("peer-messaging.service")
+    notices = tracker(install, "peer_receive")
+    first = call("peer_send", "sender", target_session_id="recipient", message="first note")
+    read = service.receive({}, "recipient")
+    assert finish(notices, "peer_receive", read) is None
+    args = {"action": "ack", "message_ids": [first["message_id"]]}
+    acknowledged = service.receive(args, "recipient")
+    assert acknowledged["acknowledged"] == [first["message_id"]]
+
+    late = call("peer_send", "sender", target_session_id="recipient", message="arrived after ACK")
+    carried = json.loads(finish(notices, "peer_receive", acknowledged, args))
+    assert "peer_receive" in carried["_peer_inbox_notice"]
+    assert carried["acknowledged"] == [first["message_id"]]
+    assert "arrived after ACK" not in json.dumps(carried)
+    assert finish(notices, "other_tool", {"value": 1}) is None
+    assert [item["message_id"] for item in service.receive({}, "recipient")["messages"]] == [late["message_id"]]
+    with open_persistence_reader(install) as store:
+        assert store.sessions.get("recipient").message_count == 0
+
+
+def test_offer_arriving_after_list_threads_is_not_suppressed(install):
+    threads = import_module("peer-messaging.threads")
+    notices = tracker(install, "list_threads", "link_thread")
+    listed = threads.list_threads({}, "recipient")
+    assert listed["threads"] == []
+    assert threads.link({"thread_id": "recipient"}, "sender")["status"] == "awaiting_other_chat"
+
+    carried = json.loads(finish(notices, "list_threads", listed))
+    assert "list_threads" in carried["_peer_link_notice"]
+    assert carried["threads"] == []
+    assert "sender" not in json.dumps(carried)
+    assert finish(notices, "other_tool", {"value": 1}) is None
+    assert [(item["thread_id"], item["link"]) for item in threads.list_threads({}, "recipient")["threads"]] == [
+        ("sender", "incoming"),
+    ]
+    with threads.graph(install) as links:
+        assert links[threads.pair("sender", "recipient")]["since"] is None
+
+
+def test_peer_arriving_after_discovery_is_not_treated_as_a_returned_address(install):
+    service = import_module("peer-messaging.service")
+    notices = tracker(install, "peer_sessions")
+    listed = service.sessions({}, "recipient")
+    assert {item["session_id"] for item in listed["peers"]} == {"sender"}
+    with open_persistence(profile_scope(home=install)) as store:
+        store.sessions.create(NewSession("late-peer", "cli", cwd="/project/other", git_repo_root="/project"))
+
+    carried = json.loads(finish(notices, "peer_sessions", listed))
+    assert "peer_sessions" in carried["_peer_discovery_notice"]
+    assert carried["peers"] == listed["peers"]
+    assert "late-peer" not in json.dumps(carried)
+    assert finish(notices, "other_tool", {"value": 1}) is None
+    assert {item["session_id"] for item in service.sessions({}, "recipient")["peers"]} == {"sender", "late-peer"}
