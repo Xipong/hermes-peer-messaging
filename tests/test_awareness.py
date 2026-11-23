@@ -166,3 +166,21 @@ def test_unrelated_subagents_do_not_crowd_local_parent_discovery(install):
     assert "subagent" in discovered["scan_limited_sources"]
     assert not (install / "runtime" / "peer_messages").exists()
     assert_no_model_work(install, "sender", "recipient", "elsewhere")
+
+
+def test_long_running_owner_not_hidden_by_default_recency_cutoff(install):
+    """A live session lease may outlive the last persisted activity stamp."""
+    from time import time
+    service = import_module("peer-messaging.service")
+    teams = import_module("peer-messaging.teams")
+    threads = import_module("peer-messaging.threads")
+    with threads.graph(install) as links, open_persistence_reader(install) as store:
+        recipient = teams.resolve(store, "recipient")
+        future_cutoff = time() + 7200  # All stored last-active timestamps are older.
+        absent, _ = service.discover(store, recipient, links, cutoff=future_cutoff, live_owners=set())
+        leased, _ = service.discover(store, recipient, links, cutoff=future_cutoff,
+                                    live_owners={"sender"})
+    assert not absent
+    assert [peer["session_id"] for peer in leased] == ["sender"]
+    # A registered owner is NOT evidence of an in-flight LLM request.
+    assert leased[0]["last_active"] < future_cutoff

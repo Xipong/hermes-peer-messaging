@@ -118,7 +118,7 @@ def owners(home):
         return None
 
 
-def discover(store, own, links, *, cutoff, same=True, index=None):
+def discover(store, own, links, *, cutoff, same=True, index=None, live_owners=None):
     """Separate bounded scans keep busy subagent trees from hiding local parents."""
     from . import teams
     from .project_identity import ProjectIndex
@@ -154,7 +154,8 @@ def discover(store, own, links, *, cutoff, same=True, index=None):
             if target == candidate:
                 stamps.append(entry.last_active)
             active = max((v for v in stamps if isinstance(v, (int, float)) and math.isfinite(v)), default=0)
-            if active < cutoff or (same and project(participant.root, index=index) != key):
+            if ((active < cutoff and target not in (live_owners or ()))
+                        or (same and project(participant.root, index=index) != key)):
                 continue
             peers.append({**teams.describe(participant), "hermes_project_id": index.named_id(participant.root),
                           "cwd": row.cwd,
@@ -173,10 +174,11 @@ def sessions(args, sid):
     home, cutoff = get_hermes_home(), time.time() - minutes * 60
     from .project_identity import ProjectIndex
     index = ProjectIndex(home)
+    live = owners(home)
     with threads.graph(home) as links, open_persistence_reader(home) as store:
         own = teams.resolve(store, sid)
-        peers, limited = discover(store, own, links, cutoff=cutoff, same=same, index=index)
-    live = owners(home) if peers else None
+        peers, limited = discover(store, own, links, cutoff=cutoff, same=same,
+                                  index=index, live_owners=live)
     for peer in peers:
         peer["owner_present"] = None if live is None else peer["session_id"] in live
     return {"success": True, **teams.describe(own), "hermes_project_id": index.named_id(own.root),
@@ -309,7 +311,8 @@ class InboxNotices:
                         from .project_identity import ProjectIndex
                         index = ProjectIndex(home)
                         if project(own.root, index=index):
-                            peers, _ = discover(store, own, links, cutoff=time.time() - 3600, index=index)
+                            peers, _ = discover(store, own, links, cutoff=time.time() - 3600,
+                                                index=index, live_owners=owners(home))
                             notices["_peer_discovery_notice"] = (
                                 frozenset(peer["session_id"] for peer in peers), DISCOVERY_HINT,
                             )
