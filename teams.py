@@ -59,16 +59,18 @@ class _Resolver:
             self.rows[sid] = row
         return self.rows[sid]
 
-    def segments(self, row):
-        """The current conversation's ancestors, never its delegating parent."""
+    def segments(self, row, *, stop_at=None):
+        """Compression ancestors, optionally bounded by a validated local root."""
         segments, seen = [row], {row.session_id}
-        while row.parent_session_id and self.store.lineage.is_compression_child(row):
+        while row.session_id != stop_at and row.parent_session_id and self.store.lineage.is_compression_child(row):
             parent = row.parent_session_id
             if parent in seen:
                 raise ValueError("Cyclic session lineage")
             row = self.get(parent)
             segments.append(row)
             seen.add(parent)
+        if stop_at is not None and row.session_id != stop_at:
+            raise ValueError("Local conversation lineage changed; retry routing")
         return tuple(segments)
 
     def live(self, row):
@@ -90,7 +92,9 @@ class _Resolver:
         current = service.route(self.store, row.session_id, follow=follow, allow_ended=self.allow_ended)
         root_id, current = threads.locate(self.store, current.session_id, allow_ended=self.allow_ended)
         current = self.get(current.session_id)
-        segments = self.segments(current)
+        # locate already stopped at an archived, foreign, or ineligible ancestor.
+        # The inbox walk must preserve that boundary and keep own mail usable.
+        segments = self.segments(current, stop_at=root_id)
         return Participant(current, root_id, root_id, current, None, None,
                            tuple(item.session_id for item in segments))
 

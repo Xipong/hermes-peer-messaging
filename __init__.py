@@ -4,8 +4,10 @@
 def register(ctx):
     from . import service, siblings, threads
 
-    service.register(ctx)
+    # Bind the real child before collecting any turn-start awareness. One
+    # result-transform hook then combines both durable and live-batch notices.
+    channel = siblings.register(ctx)
+    service.register(ctx, sibling_notices=channel.notices)
     threads.register(ctx)
-    siblings.register(ctx)
 
 __all__ = ["register"]

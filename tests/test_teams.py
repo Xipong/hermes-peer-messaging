@@ -6,7 +6,7 @@ import pytest
 from persistence.conversation.sessions import NewSession, SessionLineageKind
 from persistence_assembly import open_persistence, open_persistence_reader, profile_scope
 
-from test_local_delivery import install  # noqa: F401 -- temporary native Hermes profile
+from test_local_delivery import call, install  # noqa: F401 -- temporary native Hermes profile
 
 teams = import_module("peer-messaging.teams")
 
@@ -129,3 +129,47 @@ def test_ended_child_requires_explicit_observation_and_closed_root_is_not_live(i
         with pytest.raises(ValueError, match="ended"):
             teams.resolve(store, "a2")
         assert teams.resolve(store, "a2", allow_ended=True).root.ended_at is not None
+
+
+@pytest.mark.parametrize("boundary", ["managed", "archived", "foreign"])
+def test_local_inbox_stops_at_validated_root_and_keeps_own_mail_usable(install, boundary):
+    # Preserve #123218's receive/ACK boundary using native storage: an eligible
+    # current session keeps its own inbox without inheriting an ineligible row.
+    with open_persistence(profile_scope(home=install)) as store:
+        store.sessions.create(NewSession("old", "telegram" if boundary == "managed" else "cli",
+                                         cwd="/project", git_repo_root="/project",
+                                         profile_name="foreign-profile" if boundary == "foreign" else None))
+        store.sessions.end("old", "compression")
+        if boundary == "archived":
+            store.sessions.set_archived("old", True)
+        store.sessions.create(NewSession("tip", "cli", parent_session_id="old", cwd="/project",
+                                         git_repo_root="/project", profile_name="default"))
+    box = import_module("peer-messaging.mailbox")
+    inbox = install / "runtime" / "peer_messages"
+    old_mail = box.enqueue(inbox / "old", sender="sender", target="old", text="ancestor-only mail")
+    own_mail = box.enqueue(inbox / "tip", sender="sender", target="tip", text="own mail")
+    with open_persistence_reader(install) as store:
+        participant = teams.resolve(store, "tip")
+        assert participant.root_id == "tip" and participant.inbox_ids == ("tip",)
+    received = call("peer_receive", "tip")
+    assert received.get("success"), received
+    assert received["messages"] == [own_mail]
+    receipt = call("peer_receive", "tip", action="ack",
+                   message_ids=[own_mail["message_id"], old_mail["message_id"]])
+    assert receipt["acknowledged"] == [own_mail["message_id"]]
+    assert receipt["not_pending"] == [old_mail["message_id"]]
+    assert (inbox / "old" / f"{old_mail['message_id']}.json").exists()
+    assert call("peer_send", "sender", target_session_id="tip", message="fresh mail")["success"]
+    assert not call("peer_send", "sender", target_session_id="old", message="invalid old alias")["success"]
+
+
+def test_child_compression_does_not_skip_an_ineligible_ownership_segment(install):
+    with open_persistence(profile_scope(home=install)) as store:
+        child(store, "a1", "sender")
+        store.sessions.end("a1", "compression")
+        store.sessions.set_archived("a1", True)
+        store.sessions.create(NewSession("a1-tip", "subagent", parent_session_id="a1",
+                                         model_config={"_delegate_from": "sender", "_subagent_id": "task-a1"}))
+    with open_persistence_reader(install) as store:
+        with pytest.raises(ValueError, match="archived"):
+            teams.resolve(store, "a1-tip")

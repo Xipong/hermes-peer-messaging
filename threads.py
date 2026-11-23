@@ -120,7 +120,8 @@ def link(args, sid):
             edge["since"] = time.time()
         status = "linked" if edge["since"] is not None else "awaiting_other_chat"
         return {"success": True, "status": status, "thread_id": other_id,
-                "note": "Both chats must offer the exact link. Linking never sends a prompt or wakes a chat."}
+                "note": "Both parents must offer the exact link. An eligible recipient can notice an incoming offer "
+                        "during its ordinary turn and inspect list_threads; no chat is started."}
 
 
 def describe(key, row):
