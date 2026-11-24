@@ -398,11 +398,11 @@ def register(ctx):
                               "description": "Filter other roots by project only."},
          })
     tool("peer_send", send,
-         "Send a decision, blocker, or handoff; combine routine progress at checkpoints. "
-         "If a delay would block someone, send now. Otherwise, include the send in the same batch as your next independent work tool when possible. "
-         "Raise cross-branch issues via your parent; delegate_task returns final summaries. "
-         "Queued means stored, not read; recipients are not woken. Check results and retry only failed addresses if needed. "
-         "recipient_state is advisory. Continue work without polling.", {
+         "Send only when a blocker, decision, or handoff changes what the recipient can or should do next. "
+         "Skip routine progress; delegate_task already delivers subagents' final reports. "
+         "Send promptly if waiting would block someone or cause conflicting work. Batch a needed send with independent work when possible. "
+         "Coordinate across branches via your parent. Queued means stored, not read; it does not wake recipients. "
+         "recipient_state is advisory. Retry only failed addresses if needed; do not poll.", {
              "target_session_ids": {"type": "array", "minItems": 1, "maxItems": MAX_RECIPIENTS,
                                     "items": {"type": "string", "minLength": 1, "maxLength": 128},
                                     "description": "Known session_ids/thread_ids or parent (immediate parent). All receive the same message."},
