@@ -267,10 +267,16 @@ def test_nested_child_gets_only_parent_and_root_addresses(install, compressed):
     from test_team_delivery import add_child
     with open_persistence(profile_scope(home=install)) as store:
         add_child(store, "parent-child", "sender")
-        add_child(store, "reader", "parent-child")
+        parent = "parent-child"
         if compressed:
-            store.sessions.end("parent-child", "compression")
-            store.sessions.create(NewSession("parent-tip", "subagent", parent_session_id="parent-child",
+            store.sessions.end(parent, "compression")
+            store.sessions.create(NewSession("parent-middle", "subagent", parent_session_id=parent,
+                                             model_config={"_delegate_from": "sender", "_subagent_id": "task-parent-child"}))
+            parent = "parent-middle"
+        add_child(store, "reader", parent)
+        if compressed:
+            store.sessions.end(parent, "compression")
+            store.sessions.create(NewSession("parent-tip", "subagent", parent_session_id=parent,
                                              model_config={"_delegate_from": "sender", "_subagent_id": "task-parent-child"}))
         for index in range(12):
             add_child(store, f"recent-{index}", "sender")

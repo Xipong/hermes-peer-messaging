@@ -25,7 +25,7 @@ def scan(store, live_owners=None, *, roots_only=False):
     for label, sources in groups:
         rows = store.sessions.list_sessions(
             SessionQuery(sources=sources, local_created_sources=tuple(sorted(service.LOCAL)) if label == "local" else None,
-                         include_children=True, include_subagents=True,
+                         include_children=True, include_subagents=not roots_only,
                          order=SessionOrder.LAST_ACTIVE, project_compression_tips=False),
             SessionWindow(limit=service.SCAN_LIMIT), compact_rows=True,
         )

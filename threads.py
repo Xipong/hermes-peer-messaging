@@ -110,12 +110,14 @@ def link(args, sid):
                 "thread_id": other_id}
 
 
-def directory(store, own, links):
+def directory(store, own, links, *, incoming_only=False):
     """Link management is independent of project/recency and peer search scope."""
     result = []
     for other_id, offers in neighbors(links, own.root_id):
         state = "linked" if accepted(offers, own.root_id, other_id) else (
             "offered" if own.root_id in offers else "incoming")
+        if incoming_only and state != "incoming":
+            continue
         other = None
         try:
             _, candidate = locate(store, other_id, allow_ended=True)

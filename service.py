@@ -164,7 +164,7 @@ def sessions(args, sid):
 
     minutes, same = args.get("active_within_minutes", 60), args.get("same_project", True)
     scope = args.get("scope", "all")
-    if type(minutes) is not int or not 1 <= minutes <= 1440 or type(same) is not bool or scope not in SCOPES:
+    if type(minutes) is not int or not 1 <= minutes <= 1440 or type(same) is not bool or not isinstance(scope, str) or scope not in SCOPES:
         raise ValueError("Use scope roots/team/all, active_within_minutes 1–1440, and boolean same_project")
     home = get_hermes_home()
     index = ProjectIndex(home)
@@ -308,26 +308,30 @@ class InboxNotices:
                 self._put(self.seen, key, True)
             if previous or listed is not None:
                 return {}
-            return {"parent": own.parent_session_id, "root": own.root_id}
+            try:
+                parent = teams.resolve(store, own.parent_session_id, allow_ended=True).thread_id
+            except ValueError:
+                parent = own.parent_session_id  # Already verified delegation edge.
+            return {"parent": parent, "root": own.root_id}
 
         shown = {peer["thread_id"] for peer in listed.get("peers", ())
                  if not peer["is_child"]} if listed is not None else set()
-        roots, incoming = set(), set()
+        roots, incoming, limited = set(), set(), []
         scan_roots = not (listed is not None and listed.get("scope") in {"roots", "all"})
         due = self._due(key, refresh=not scan_roots)
         # Root discovery needs no graph: independent parents can always message.
         if due and scan_roots:
             snapshot = DISCOVERY_CACHE.get(home, store, now=time.monotonic(), max_age=DISCOVERY_INTERVAL,
                                            owner_loader=owners, roots_only=True)
-            peers, _ = discover(store, own, {}, cutoff=time.time() - 3600, scope="roots",
+            peers, limited = discover(store, own, {}, cutoff=time.time() - 3600, scope="roots",
                                 live_owners=snapshot.live_owners, snapshot=snapshot)
             roots = {peer["thread_id"] for peer in peers}
 
         inspect_links = pin_has_tool(own.row.tool_pin, "link_thread")
         if inspect_links:
             with threads.graph(home) as links:
-                incoming = {item["thread_id"] for item in threads.directory(store, own, links)
-                            if item["link"] == "incoming" and item["session_id"] is not None
+                incoming = {item["thread_id"] for item in threads.directory(store, own, links, incoming_only=True)
+                            if item["session_id"] is not None
                             and item["ended_at"] is None}
         shown_links = {item["thread_id"] for item in listed.get("links", ())
                        if item["link"] == "incoming"} if listed is not None else set()
@@ -343,7 +347,7 @@ class InboxNotices:
             result["neighbors"] = sorted(new_roots)[:8]
         if new_offers:
             result["incoming_links"] = sorted(new_offers)[:8]
-        if len(new_roots) > 8 or len(new_offers) > 8:
+        if len(new_roots) > 8 or len(new_offers) > 8 or (new_roots and limited):
             result["has_more"] = True
         return result
 

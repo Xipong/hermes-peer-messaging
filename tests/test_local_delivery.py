@@ -154,3 +154,18 @@ def test_contended_session_metadata_is_retryable_without_consuming_mail(install)
     recovered = call("peer_receive", "recipient")
     assert [message["message_id"] for message in recovered["messages"]] == [sent["message_id"]]
     assert call("peer_receive", "recipient", action="ack", message_ids=[sent["message_id"]])["acknowledged"] == [sent["message_id"]]
+
+
+def test_new_storage_ignores_previous_version_without_migration(install):
+    from importlib import import_module
+
+    legacy = install / "runtime" / "peer_messages" / "recipient"
+    box = import_module("peer-messaging.mailbox")
+    old = box.enqueue(legacy, sender="sender", target="recipient", text="Old session mail")
+    original = (legacy / f"{old['message_id']}.json").read_bytes()
+    (legacy.parent / ".threads.json").write_text('{"version":1,"links":{}}')
+    assert call("peer_receive", "recipient")["messages"] == []
+    sent = call("peer_send", "sender", target_session_id="recipient", message="New session mail")
+    assert [item["message_id"] for item in call("peer_receive", "recipient")["messages"]] == [sent["message_id"]]
+    assert (legacy / f"{old['message_id']}.json").read_bytes() == original
+    assert (install / "runtime" / "peer_messages_v2" / "recipient").is_dir()
