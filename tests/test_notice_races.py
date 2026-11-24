@@ -1,6 +1,7 @@
 """A delivery between an operation and its result hook must remain discoverable."""
 import json
 from importlib import import_module
+from types import SimpleNamespace
 
 from persistence.conversation.sessions import NewSession
 from persistence_assembly import open_persistence, open_persistence_reader, profile_scope
@@ -82,17 +83,23 @@ def test_offer_arriving_after_list_threads_is_not_suppressed(install):
         assert links[threads.pair("sender", "recipient")]["since"] is None
 
 
-def test_peer_arriving_after_discovery_is_not_treated_as_a_returned_address(install):
+def test_peer_arriving_after_discovery_is_not_treated_as_a_returned_address(install, monkeypatch):
     service = import_module("peer-messaging.service")
+    clock = [100.0]
+    monkeypatch.setattr(service, "time", SimpleNamespace(monotonic=lambda: clock[0], time=service.time.time))
     notices = tracker(install, "peer_sessions")
     listed = service.sessions({}, "recipient")
     assert {item["session_id"] for item in listed["peers"]} == {"sender"}
     with open_persistence(profile_scope(home=install)) as store:
         store.sessions.create(NewSession("late-peer", "cli", cwd="/project/other", git_repo_root="/project"))
 
-    carried = json.loads(finish(notices, "peer_sessions", listed))
-    assert "peer_sessions" in carried["_peer_discovery_notice"]
-    assert carried["peers"] == listed["peers"]
-    assert "late-peer" not in json.dumps(carried)
+    # A successful explicit directory is already fresh; its result hook does
+    # not do a second full scan or pretend it returned the later arrival.
+    assert finish(notices, "peer_sessions", listed) is None
     assert finish(notices, "other_tool", {"value": 1}) is None
+    clock[0] += service.DISCOVERY_INTERVAL
+    carried = json.loads(finish(notices, "other_tool", {"value": 2}))
+    assert "peer_sessions" in carried["_peer_discovery_notice"]
+    assert "late-peer" in {peer["session_id"] for peer in carried["_peer_roster"]["peers"]}
+    assert finish(notices, "other_tool", {"value": 3}) is None
     assert {item["session_id"] for item in service.sessions({}, "recipient")["peers"]} == {"sender", "late-peer"}

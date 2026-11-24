@@ -140,32 +140,43 @@ def read_pending(inboxes: list[Path], *, limit: int = MAX_READ_MESSAGES) -> dict
 
     Envelopes are immutable and published by atomic rename, so readers see a
     complete file or no file. A concurrent ACK can remove a snapshot entry.
+    Only the requested FIFO page is decoded. pending_count includes uninspected
+    or unreadable candidate files until pending_count_is_exact becomes true;
+    has_more therefore also includes candidates that still need validation.
     """
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_READ_MESSAGES:
         raise ValueError(f"limit must be between 1 and {MAX_READ_MESSAGES}")
-    entries, unreadable = [], 0
+    paths = []
     for inbox in inboxes:
         if not inbox.is_dir():
             continue
         if inbox.is_symlink():
             raise ValueError("Peer inbox must not be a symlink")
-        for path in _paths(inbox):
-            try:
-                entry = _load(path)
-                if entry is None:
-                    # Only demonstrated invalidity permits poison-file removal.
-                    path.unlink(missing_ok=True)
-                else:
-                    entries.append(entry)
-            except FileNotFoundError:
-                # A concurrent explicit ACK is not a failed read to retry.
-                continue
-            except (OSError, ValueError):
-                unreadable += 1
-                logger.debug("peer inbox: cannot read %s", path.name, exc_info=True)
-    entries.sort(key=lambda e: e["message_id"])
-    return {"messages": entries[:limit], "has_more": len(entries) > limit,
-            "pending_count": len(entries), "unreadable_count": unreadable}
+        paths.extend(_paths(inbox))
+    # Compression ancestry can contain older and newer mail in either directory.
+    paths.sort(key=lambda path: path.stem)
+    entries, unreadable, inspected, pending = [], 0, 0, len(paths)
+    for path in paths:
+        if len(entries) == limit:
+            break
+        inspected += 1
+        try:
+            entry = _load(path)
+            if entry is None:
+                # Only demonstrated invalidity permits poison-file removal.
+                path.unlink(missing_ok=True)
+                pending -= 1
+            else:
+                entries.append(entry)
+        except FileNotFoundError:
+            # A concurrent explicit ACK is not a failed read to retry.
+            pending -= 1
+        except (OSError, ValueError):
+            unreadable += 1
+            logger.debug("peer inbox: cannot read %s", path.name, exc_info=True)
+    return {"messages": entries, "has_more": pending > len(entries),
+            "pending_count": pending, "pending_count_is_exact": inspected == len(paths) and not unreadable,
+            "unreadable_count": unreadable}
 
 
 def acknowledge(inboxes: list[Path], ids: list[str], *, lock_timeout=2.0) -> dict[str, Any]:
