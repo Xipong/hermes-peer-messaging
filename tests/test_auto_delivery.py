@@ -23,7 +23,7 @@ def pending(home):
 
 def queue(message="A peer finding; continue the existing task"):
     sent = call("peer_send", "sender", target_session_ids=["recipient"], message=message)["results"][0]
-    assert sent.get("success"), sent
+    assert sent["status"] == "queued", sent
     return sent["message_id"]
 
 
