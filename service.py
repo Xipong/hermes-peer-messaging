@@ -400,7 +400,8 @@ def register(ctx):
     tool("peer_send", send,
          "Send only when a blocker, decision, or handoff changes what the recipient can or should do next. "
          "Skip routine progress; delegate_task already delivers subagents' final reports. "
-         "Send promptly if waiting would block someone or cause conflicting work. Batch a needed send with independent work when possible. "
+         "If a message is necessary and independent work is ready, call peer_send and the work tool in the same batch. "
+         "Don't wait to form a batch if delay would block someone or cause conflicting work. "
          "Coordinate across branches via your parent. Queued means stored, not read; it does not wake recipients. "
          "recipient_state is advisory. Retry only failed addresses if needed; do not poll.", {
              "target_session_ids": {"type": "array", "minItems": 1, "maxItems": MAX_RECIPIENTS,
