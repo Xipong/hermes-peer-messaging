@@ -3,7 +3,6 @@ import json
 import os
 import subprocess
 import sys
-from importlib import import_module
 from pathlib import Path
 
 import pytest
@@ -39,77 +38,84 @@ def teams(install):
     return install
 
 
-def link_roots():
-    assert ok("link_thread", "sender", thread_id="recipient")["status"] == "awaiting_other_chat"
-    assert ok("link_thread", "recipient", thread_id="sender")["status"] == "linked"
-
-
 def peers(sid, **kwargs):
     return {peer["session_id"]: peer for peer in ok("peer_sessions", sid, **kwargs)["peers"]}
 
 
-def test_discovery_and_cross_team_messages_require_both_parent_links(teams):
+def test_roots_keep_workers_private_and_coordination_goes_through_parents(teams):
     assert set(peers("sender")) == {"recipient", "a1", "a2"}
     assert set(peers("a1")) == {"sender", "a2"}
     assert not call("peer_send", "a1", target_session_id="b1", message="too early")["success"]
     assert not call("peer_send", "sender", target_session_id="b1", message="too early")["success"]
-    assert not call("link_thread", "a1", thread_id="recipient")["success"]
-    assert not call("link_thread", "sender", thread_id="b1")["success"]
-
-    ok("link_thread", "sender", thread_id="recipient")
-    assert "b1" not in peers("a1")
-    assert not call("peer_send", "a1", target_session_id="b1", message="one offer only")["success"]
-    ok("link_thread", "recipient", thread_id="sender")
     discovered = peers("a1")
-    assert set(discovered) == {"sender", "a2", "recipient", "b1", "b2"}
-    assert discovered["b1"]["root_thread_id"] == "recipient"
-    assert discovered["b1"]["parent_session_id"] == "recipient"
-    assert discovered["b1"]["subagent_id"] == "task-b1"
-    assert discovered["b1"]["is_child"] is True
+    assert set(discovered) == {"sender", "a2"}
+    assert discovered["a2"]["parent_thread_id"] == "sender"
+    assert discovered["a2"]["subagent_id"] == "task-a2"
+    assert discovered["a2"]["is_child"] is True
+    assert set(peers("sender")) == {"recipient", "a1", "a2"}
+    for sender, target in (("a1", "b1"), ("a1", "recipient"), ("sender", "b1")):
+        assert not call("peer_send", sender, target_session_id=target, message="Still outside my family")["success"]
 
-    first = ok("peer_send", "a1", target_session_id="b1", message="I own parser.py; avoid concurrent edits")
-    assert first["from_session_id"] == "a1" and first["from_root_thread_id"] == "sender"
-    assert first["target_session_id"] == "b1" and first["target_root_thread_id"] == "recipient"
+    finding = ok("peer_send", "a1", target_session_id="parent", message="I own parser.py; avoid concurrent edits")
+    assert ok("peer_receive", "sender")["messages"][0]["message_id"] == finding["message_id"]
+    coordinated = ok("peer_send", "sender", target_session_id="recipient", message="Our worker owns parser.py",
+                     in_reply_to=finding["message_id"])
+    assert ok("peer_receive", "recipient")["messages"][0]["message_id"] == coordinated["message_id"]
+    first = ok("peer_send", "recipient", target_session_id="b1", message="Avoid parser.py; handle tests",
+               in_reply_to=coordinated["message_id"])
+    assert first["from_session_id"] == "recipient"
+    assert first["target_session_id"] == "b1"
     inbox = ok("peer_receive", "b1")
     assert inbox["authority"] == "peer_data"
     assert inbox["messages"][0]["message_id"] == first["message_id"]
-    assert inbox["messages"][0]["from_session_id"] == "a1"
-    assert ok("peer_receive", "recipient")["messages"] == []
+    assert inbox["messages"][0]["from_session_id"] == "recipient"
+    assert inbox["messages"][0]["in_reply_to"] == coordinated["message_id"]
     assert ok("peer_receive", "b2")["messages"] == []
 
-    reported = ok("peer_send", "b1", target_session_id="recipient", message="Other team owns parser.py",
+    reported = ok("peer_send", "b1", target_session_id="parent", message="Tests are ready",
                   in_reply_to=first["message_id"])
-    assert ok("peer_receive", "recipient")["messages"][0]["message_id"] == reported["message_id"]
-    response = ok("peer_send", "recipient", target_session_id="a1", message="Our team will handle the tests",
+    assert [note["message_id"] for note in ok("peer_receive", "recipient")["messages"]] == [
+        coordinated["message_id"], reported["message_id"],
+    ]
+    response = ok("peer_send", "recipient", target_session_id="sender", message="Our team's tests are ready",
                   in_reply_to=reported["message_id"])
+    forwarded = ok("peer_send", "sender", target_session_id="a1", message="Other team's tests are ready",
+                   in_reply_to=response["message_id"])
     answer = ok("peer_receive", "a1")["messages"][0]
-    assert answer["message_id"] == response["message_id"]
-    assert answer["from_session_id"] == "recipient" and answer["in_reply_to"] == reported["message_id"]
+    assert answer["message_id"] == forwarded["message_id"]
+    assert answer["from_session_id"] == "sender" and answer["in_reply_to"] == response["message_id"]
     assert ok("peer_receive", "a2")["messages"] == []
     with open_persistence_reader(teams) as store:
         assert all(store.sessions.get(sid).message_count == 0
                    for sid in ("sender", "recipient", "a1", "a2", "b1", "b2"))
 
 
-def test_same_team_cross_batch_and_nested_messages_keep_separate_inboxes(teams):
+def test_nested_family_boundaries_and_separate_inboxes(teams):
     with open_persistence(profile_scope(home=teams)) as store:
         add_child(store, "a-deep", "a1", cwd="/isolated/worktree", git_root="/isolated/worktree")
+        add_child(store, "a-deep-sibling", "a1")
+        add_child(store, "a-cousin", "a2")
     discovered = peers("a-deep")
-    assert {"sender", "a1", "a2"} <= set(discovered)
-    assert "b1" not in discovered
-    assert ok("peer_sessions", "a-deep")["root_thread_id"] == "sender"
+    assert set(discovered) == {"a1", "a-deep-sibling"}
+    for scope in ("all", "team", "roots"):
+        visible = set(peers("a-deep", scope=scope, same_project=False))
+        assert visible == (set() if scope == "roots" else {"a1", "a-deep-sibling"})
+    for inaccessible in ("sender", "a2", "a-cousin", "recipient", "b1", "b2"):
+        assert not call("peer_send", "a-deep", target_session_id=inaccessible, message="Outside immediate family")["success"]
+        assert not call("peer_send", inaccessible, target_session_id="a-deep", message="Outside immediate family")["success"]
     sibling_note = ok("peer_send", "a1", target_session_id="a2", message="Separate batch, same parent")
     assert ok("peer_receive", "a2")["messages"][0]["message_id"] == sibling_note["message_id"]
-    parent_note = ok("peer_send", "sender", target_session_id="a-deep", message="Nested review requested earlier")
+    nested_note = ok("peer_send", "a-deep", target_session_id="a-deep-sibling", message="Same immediate parent")
+    assert ok("peer_receive", "a-deep-sibling")["messages"][0]["message_id"] == nested_note["message_id"]
+    parent_note = ok("peer_send", "a1", target_session_id="a-deep", message="Nested review requested earlier")
     assert ok("peer_receive", "a-deep")["messages"][0]["message_id"] == parent_note["message_id"]
-    root_note = ok("peer_send", "a-deep", target_session_id="sender", message="Nested finding")
-    assert ok("peer_receive", "sender")["messages"][0]["message_id"] == root_note["message_id"]
-    assert ok("peer_receive", "a1")["messages"] == []
+    report = ok("peer_send", "a-deep", target_session_id="parent", message="Nested finding")
+    assert ok("peer_receive", "a1")["messages"][0]["message_id"] == report["message_id"]
+    assert ok("peer_receive", "sender")["messages"] == []
     assert ok("peer_receive", "a1", action="ack", message_ids=[parent_note["message_id"]])["acknowledged"] == []
     assert ok("peer_receive", "a-deep")["messages"][0]["message_id"] == parent_note["message_id"]
-    link_roots()
-    cross = ok("peer_send", "a-deep", target_session_id="b2", message="Nested cross-team finding")
-    assert ok("peer_receive", "b2")["messages"][0]["message_id"] == cross["message_id"]
+    assert set(peers("a-deep", same_project=False)) == {"a1", "a-deep-sibling"}
+    assert not call("peer_send", "a-deep", target_session_id="b2", message="Links do not widen family")["success"]
 
 
 def test_parent_alias_targets_immediate_parent_through_compaction(teams):
@@ -123,12 +129,18 @@ def test_parent_alias_targets_immediate_parent_through_compaction(teams):
             ))
         store.sessions.end("sender", "compression")
         store.sessions.create(NewSession("sender-tip", "cli", parent_session_id="sender"))
+        add_child(store, "nested-later", "a1-tip")
 
     sent = ok("peer_send", "nested-tip", target_session_id="parent", message="For my immediate parent")
     assert sent["requested_target_session_id"] == "parent"
     assert sent["target_session_id"] == "a1-tip"
     assert ok("peer_receive", "a1-tip")["messages"][0]["message_id"] == sent["message_id"]
     assert ok("peer_receive", "sender-tip")["messages"] == []
+    assert set(peers("nested-tip")) == {"a1-tip", "nested-later"}
+    sibling = ok("peer_send", "nested-tip", target_session_id="nested-later", message="Sibling born after parent compaction")
+    assert ok("peer_receive", "nested-later")["messages"][0]["message_id"] == sibling["message_id"]
+    for alias in ("sender", "sender-tip"):
+        assert not call("peer_send", "nested-tip", target_session_id=alias, message="Cannot skip my parent")["success"]
     reported = ok("peer_send", "a1-tip", target_session_id="parent", message="For the root")
     assert reported["target_session_id"] == "sender-tip"
     assert ok("peer_receive", "sender-tip")["messages"][0]["message_id"] == reported["message_id"]
@@ -136,8 +148,7 @@ def test_parent_alias_targets_immediate_parent_through_compaction(teams):
     assert refused["success"] is False and "no delegation parent" in refused["error"]
 
 
-def test_cross_project_parent_consent_enables_only_peer_mail(install):
-    from test_awareness import pin, tool
+def test_cross_project_roots_never_grant_worker_access(install):
     from test_hermes_projects import project
 
     with open_persistence(profile_scope(home=install)) as store:
@@ -145,29 +156,21 @@ def test_cross_project_parent_consent_enables_only_peer_mail(install):
         add_child(store, "other-child", "elsewhere", cwd="/other/work", git_root="/other")
     args = {"target_session_id": "other-child", "message": "Cross-project coordination"}
     assert not call("peer_send", "api-child", **args)["success"]
-    pin(install, "elsewhere")
-    assert ok("link_thread", "sender", thread_id="elsewhere")["status"] == "awaiting_other_chat"
-    assert tool("elsewhere", "incoming")["peer_update"]["incoming_links"] == ["sender"]
-    offer, = ok("peer_sessions", "elsewhere")["links"]
-    assert offer["thread_id"] == "sender" and offer["link"] == "incoming"
-    assert "other-child" not in peers("api-child", same_project=False)
+    for same_project in (True, False):
+        assert set(peers("api-child", same_project=same_project)) == {"sender"}
     assert not call("peer_send", "api-child", **args)["success"]
-
-    accepted = ok("link_thread", "elsewhere", thread_id="sender")
-    assert accepted["status"] == "linked"
-    assert "other-child" not in peers("api-child")
-    assert "other-child" in peers("api-child", same_project=False)
-    sent = ok("peer_send", "api-child", **args)
-    assert ok("peer_receive", "other-child")["messages"][0]["message_id"] == sent["message_id"]
-    reply = ok("peer_send", "other-child", target_session_id="api-child", message="Received",
+    sent = ok("peer_send", "sender", target_session_id="elsewhere", message="Cross-project root coordination")
+    assert ok("peer_receive", "elsewhere")["messages"][0]["message_id"] == sent["message_id"]
+    reply = ok("peer_send", "elsewhere", target_session_id="sender", message="Received",
                in_reply_to=sent["message_id"])
-    assert ok("peer_receive", "api-child")["messages"][0]["message_id"] == reply["message_id"]
-    # Changing project membership changes discovery, not the direct link.
+    assert ok("peer_receive", "sender")["messages"][0]["message_id"] == reply["message_id"]
+    # Project membership can group coordinators but cannot widen a worker's family.
     project(install, "Combined project", "/project", "/other")
-    assert "other-child" in peers("api-child")
-    assert ok("peer_sessions", "sender")["links"][0]["link"] == "linked"
-    ok("link_thread", "sender", thread_id="elsewhere", action="unlink")
+    assert set(peers("api-child")) == {"sender"}
+    assert "elsewhere" in peers("sender")
     assert not call("peer_send", "api-child", **args)["success"]
+    assert not call("peer_send", "api-child", **args)["success"]
+    assert ok("peer_send", "sender", target_session_id="elsewhere", message="Roots remain reachable")["status"] == "queued"
 
 
 def test_pathless_team_discovers_other_batches_and_parent_without_project(install):
@@ -181,7 +184,7 @@ def test_pathless_team_discovers_other_batches_and_parent_without_project(instal
     pin(install, "batch-two")
     found = peers("batch-one")
     assert set(found) == {"root", "batch-two"}
-    assert found["batch-two"]["root_thread_id"] == "root"
+    assert found["batch-two"]["parent_thread_id"] == "root"
     sent = ok("peer_send", "batch-one", target_session_id=found["batch-two"]["session_id"], message="Across calls")
     notice = tool("batch-two", "child-turn")
     assert notice["peer_update"]["parent"] == "root" and not notice["peer_update"].get("mail_pending")
@@ -194,42 +197,14 @@ def test_pathless_team_discovers_other_batches_and_parent_without_project(instal
     assert ok("peer_receive", "batch-one")["messages"][0]["message_id"] == reply["message_id"]
 
 
-def test_unlink_revokes_child_access_without_destroying_already_queued_mail(teams):
-    link_roots()
-    accepted = ok("peer_send", "a1", target_session_id="b1", message="Accepted while linked")
-    ok("link_thread", "recipient", thread_id="sender", action="unlink")
-    assert set(peers("a1")) == {"sender", "a2"}
-    assert not call("peer_send", "a1", target_session_id="b1", message="after unlink")["success"]
-    assert not call("peer_send", "b1", target_session_id="sender", message="after unlink")["success"]
-    assert ok("peer_receive", "b1")["messages"][0]["message_id"] == accepted["message_id"]
-    assert ok("peer_receive", "b1", action="ack", message_ids=[accepted["message_id"]])["acknowledged"] == [accepted["message_id"]]
-    assert ok("peer_send", "a1", target_session_id="a2", message="Own team still reachable")["status"] == "queued"
-
-
-def test_cross_team_send_holds_consent_until_publication(teams, monkeypatch):
-    link_roots()
-    service = import_module("peer-messaging.service")
-    mailbox = import_module("peer-messaging.mailbox")
-    enqueue = mailbox.enqueue
-    graph = teams / "runtime" / "peer_messages_v2" / ".threads.json"
-    before, modified = graph.read_bytes(), graph.stat().st_mtime_ns
-    attempted = []
-
-    def revoke_before_publication(*args, **kwargs):
-        # A sender paused after admission must not publish behind a successful
-        # unlink. Competing revocation times out retryably on the real file lock.
-        attempted.append(call("link_thread", "recipient", thread_id="sender", action="unlink"))
-        return enqueue(*args, **kwargs)
-
-    monkeypatch.setattr(mailbox, "enqueue", revoke_before_publication)
-    sent = service.send({"target_session_id": "b1", "message": "Admitted before revocation"}, "a1")
-    assert len(attempted) == 1 and attempted[0]["success"] is False
-    assert attempted[0]["retryable"] is True
-    # Locking a graph snapshot for sending does not republish link state.
-    assert graph.read_bytes() == before and graph.stat().st_mtime_ns == modified
-    assert ok("link_thread", "recipient", thread_id="sender", action="unlink")["status"] == "unlinked"
-    assert not call("peer_send", "a1", target_session_id="b1", message="After revocation")["success"]
-    assert ok("peer_receive", "b1")["messages"][0]["message_id"] == sent["message_id"]
+def test_recipient_can_read_published_mail_after_sender_finishes(teams):
+    sent = ok("peer_send", "a1", target_session_id="a2", message="Finding before completion")
+    with open_persistence(profile_scope(home=teams)) as store:
+        store.sessions.end("a1", "agent_close")
+    assert "a1" not in peers("a2")
+    assert not call("peer_send", "a2", target_session_id="a1", message="Closed recipient")["success"]
+    assert ok("peer_receive", "a2")["messages"][0]["message_id"] == sent["message_id"]
+    assert ok("peer_receive", "a2", action="ack", message_ids=[sent["message_id"]])["acknowledged"] == [sent["message_id"]]
 
 
 def test_gateway_foreign_or_unattributed_children_cannot_route_as_local_teams(teams):
@@ -247,25 +222,22 @@ def test_gateway_foreign_or_unattributed_children_cannot_route_as_local_teams(te
     assert ok("peer_receive", "sender")["messages"] == []
 
 
-def test_branched_root_and_its_children_do_not_inherit_team_links(teams):
-    link_roots()
+def test_branched_root_and_its_children_remain_separate(teams):
     with open_persistence(profile_scope(home=teams)) as store:
         store.sessions.create(NewSession(
             "branched-root", "desktop", parent_session_id="sender", lineage_kind=SessionLineageKind.BRANCH,
             cwd="/project/api", git_repo_root="/project",
         ))
         add_child(store, "branched-child", "branched-root")
-    assert ok("peer_sessions", "branched-child")["root_thread_id"] == "branched-root"
     assert set(peers("branched-child")) == {"branched-root"}
-    assert ok("peer_sessions", "branched-root")["links"] == []
-    assert not call("peer_send", "branched-child", target_session_id="b1", message="no inherited link")["success"]
+    assert peers("branched-child")["branched-root"]["thread_id"] == "branched-root"
+    assert not call("peer_send", "branched-child", target_session_id="b1", message="different root")["success"]
     assert not call("peer_send", "a1", target_session_id="branched-child", message="separate root")["success"]
 
 
 def test_child_compaction_preserves_only_that_childs_mail_and_team(teams):
-    link_roots()
-    pending = ok("peer_send", "a1", target_session_id="b1", message="Keep through child rotation")
-    parent_note = ok("peer_send", "a1", target_session_id="recipient", message="Parent inbox only")
+    pending = ok("peer_send", "b2", target_session_id="b1", message="Keep through child rotation")
+    parent_note = ok("peer_send", "b2", target_session_id="recipient", message="Parent inbox only")
     with open_persistence(profile_scope(home=teams)) as store:
         store.sessions.end("b1", "compression")
         store.sessions.create(NewSession(
@@ -275,8 +247,8 @@ def test_child_compaction_preserves_only_that_childs_mail_and_team(teams):
     received = ok("peer_receive", "b1-tip")
     assert [note["message_id"] for note in received["messages"]] == [pending["message_id"]]
     assert ok("peer_receive", "recipient")["messages"][0]["message_id"] == parent_note["message_id"]
-    assert peers("a1")["b1-tip"]["root_thread_id"] == "recipient"
-    followup = ok("peer_send", "a2", target_session_id="b1", message="Resolve old child address")
+    assert peers("b2")["b1-tip"]["thread_id"] == "b1"
+    followup = ok("peer_send", "b2", target_session_id="b1", message="Resolve old child address")
     assert followup["target_session_id"] == "b1-tip"
     folder = teams / "runtime" / "peer_messages_v2"
     assert (folder / "b1" / f"{followup['message_id']}.json").is_file()
@@ -316,17 +288,16 @@ print("PEER_RESULT:" + result)
     return reply
 
 
-def test_linked_team_exchange_survives_fresh_os_processes(teams):
-    link_roots()
-    sent = process_call(teams, "peer_send", "a1", target_session_id="b1", message="Fresh-process finding")
-    received = process_call(teams, "peer_receive", "b1")
+def test_sibling_exchange_survives_fresh_os_processes(teams):
+    sent = process_call(teams, "peer_send", "a1", target_session_id="a2", message="Fresh-process finding")
+    received = process_call(teams, "peer_receive", "a2")
     assert received["messages"][0]["message_id"] == sent["message_id"]
     assert received["messages"][0]["from_session_id"] == "a1"
-    reply = process_call(teams, "peer_send", "b1", target_session_id="a1", message="Fresh-process reply",
+    reply = process_call(teams, "peer_send", "a2", target_session_id="a1", message="Fresh-process reply",
                          in_reply_to=sent["message_id"])
     assert ok("peer_receive", "a1")["messages"][0]["message_id"] == reply["message_id"]
     assert ok("peer_receive", "a1")["messages"][0]["in_reply_to"] == sent["message_id"]
-    assert process_call(teams, "peer_receive", "b1", action="ack", message_ids=[sent["message_id"]])["acknowledged"] == [sent["message_id"]]
-    assert ok("peer_receive", "b1")["messages"] == []
+    assert process_call(teams, "peer_receive", "a2", action="ack", message_ids=[sent["message_id"]])["acknowledged"] == [sent["message_id"]]
+    assert ok("peer_receive", "a2")["messages"] == []
     with open_persistence_reader(teams) as store:
-        assert store.sessions.get("a1").message_count == store.sessions.get("b1").message_count == 0
+        assert store.sessions.get("a1").message_count == store.sessions.get("a2").message_count == 0

@@ -1,15 +1,76 @@
-"""Durable local-team identities, derived from verified stored parent edges.
+"""Durable participant identities and immediate-family communication boundaries.
 
 Subagent markers locate candidates; they never establish ownership on their own.
-Only a direct link between the two local roots grants communication across teams.
+Coordinators carry information between branches, never opening access to foreign workers.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from persistence.conversation.sessions import SessionRecord
+from persistence.conversation.sessions import END_REASON_COMPRESSION, SessionLineageKind, SessionRecord
 
 from . import mailbox
+
+LOCAL = frozenset({"cli", "tui", "desktop", "gui"})
+STORED = LOCAL | {"local"}
+
+
+def surface(row):
+    label = row.created_source if row.source == "local" else row.source
+    return "desktop" if label == "gui" else label
+
+
+def same_profile(a, b):
+    return not a or not b or a == b
+
+
+def _route(store, sid, *, allow_ended=False) -> SessionRecord:
+    sid = mailbox.session_component(sid)
+    chain = store.lineage.chain(sid) or (sid,)
+    if chain[0] != sid:
+        raise ValueError("This chat rotated; use its current session")
+    previous, profile = None, None
+    for index, segment in enumerate(chain):
+        row = store.sessions.get(mailbox.session_component(segment))
+        if row is None:
+            raise ValueError("Unknown session; use an exact ID from peer_sessions")
+        if not store.sessions.owns_session(row.session_id):
+            raise ValueError("Peer routing cannot cross profiles")
+        continues = index < len(chain) - 1
+        valid_end = (continues and row.end_reason == END_REASON_COMPRESSION) or (not continues and allow_ended)
+        if row.hidden or row.archived or (row.ended_at is not None and not valid_end):
+            raise ValueError("Session is hidden, ended, or archived; refresh peer_sessions")
+        if (row.source not in STORED or surface(row) not in LOCAL or row.model_config_corrupt
+                or row.lineage_kind is SessionLineageKind.DELEGATE or row.model_config.get("_delegate_from")):
+            raise ValueError("Peer messaging is only for independent local CLI, TUI, and Desktop chats")
+        if previous and (row.parent_session_id != previous.session_id
+                         or previous.end_reason != END_REASON_COMPRESSION
+                         or previous.session_id in (row.branched_from, row.reset_from)):
+            raise ValueError("Session no longer follows the selected compression route")
+        if not same_profile(profile, row.profile_name):
+            raise ValueError("Peer routing cannot cross profiles")
+        profile = profile or row.profile_name
+        previous = row
+    assert previous is not None  # The chain includes at least the requested session.
+    return previous
+
+
+def _locate(store, sid, *, allow_ended=False):
+    tip = _route(store, sid, allow_ended=allow_ended)
+    first = tip
+    seen = {tip.session_id}
+    while first.parent_session_id and first.parent_session_id not in seen:
+        parent = store.sessions.get(mailbox.session_component(first.parent_session_id))
+        if not parent or parent.end_reason != END_REASON_COMPRESSION:
+            break
+        try:
+            if _route(store, parent.session_id, allow_ended=allow_ended).session_id != tip.session_id:
+                break
+        except ValueError:
+            break
+        seen.add(parent.session_id)
+        first = parent
+    return first.session_id, tip
 
 
 @dataclass(frozen=True)
@@ -19,6 +80,7 @@ class Participant:
     root_id: str
     root: SessionRecord
     parent_session_id: str | None
+    parent_thread_id: str | None
     subagent_id: str | None
 
     @property
@@ -76,21 +138,15 @@ class _Resolver:
 
     @staticmethod
     def worker(row):
-        from . import service
-
-        if row.source != "subagent" and (row.source not in service.STORED or service.surface(row) not in service.LOCAL):
+        if row.source != "subagent" and (row.source not in STORED or surface(row) not in LOCAL):
             raise ValueError("Peer teams require local delegated sessions")
 
     def local(self, row, *, follow=True):
-        # Import lazily: service dispatch uses this resolver, while the existing
-        # local route remains the authority for supported conversation surfaces.
-        from . import threads
-
-        root_id, current = threads.locate(self.store, row.session_id, allow_ended=self.allow_ended)
+        root_id, current = _locate(self.store, row.session_id, allow_ended=self.allow_ended)
         if not follow and current.session_id != row.session_id:
             raise ValueError("This chat rotated; use its current session")
         current = self.get(current.session_id)
-        return Participant(current, root_id, root_id, current, None, None)
+        return Participant(current, root_id, root_id, current, None, None, None)
 
     def team_root(self, row):
         seen = set()
@@ -135,8 +191,12 @@ class _Resolver:
             raise ValueError("This chat rotated; use its current session")
         self.live(current)
         root = self.team_root(first)
+        parent = self.get(first.parent_session_id)
+        # The stored delegation edge can point to any verified compression
+        # segment. Siblings born before and after that rotation share a parent.
+        parent_id = self.segments(parent)[-1].session_id if _child(parent) else root.thread_id
         return Participant(current, first.session_id, root.root_id, root.root,
-                           first.parent_session_id, _subagent_id(current) or subagent_id)
+                           first.parent_session_id, parent_id, _subagent_id(current) or subagent_id)
 
 
 def resolve(store, sid, *, follow=True, allow_ended=False) -> Participant:
@@ -145,22 +205,51 @@ def resolve(store, sid, *, follow=True, allow_ended=False) -> Participant:
     return resolver.child(row, follow=follow) if _child(row) else resolver.local(row, follow=follow)
 
 
-def allowed(a, b, links) -> bool:
-    from . import service, threads
-
-    if not service.same_profile(a.root.profile_name, b.root.profile_name):
-        return False
-    if a.root_id == b.root_id:
-        return True
+def relationship(a, b) -> str | None:
+    """Describe b from a's permitted neighborhood, using stable parent edges."""
+    if not same_profile(a.root.profile_name, b.root.profile_name):
+        return None
+    if a.thread_id == b.thread_id:
+        return "self"
     if not (a.is_child or b.is_child):
-        return True
-    return threads.accepted(links.get(threads.pair(a.root_id, b.root_id)), a.root_id, b.root_id)
+        return "peer"
+    if a.root_id != b.root_id:
+        return None
+    if a.parent_thread_id == b.thread_id:
+        return "parent"
+    if b.parent_thread_id == a.thread_id:
+        return "child"
+    if a.parent_thread_id is not None and a.parent_thread_id == b.parent_thread_id:
+        return "sibling"
+    return None
 
 
-def describe(participant) -> dict:
-    from . import service
+def allowed(a, b) -> bool:
+    return relationship(a, b) not in {None, "self"}
 
-    return {"session_id": participant.row.session_id, "thread_id": participant.thread_id,
-            "root_thread_id": participant.root_id, "parent_session_id": participant.parent_session_id,
-            "subagent_id": participant.subagent_id, "is_child": participant.is_child,
-            "title": participant.row.title, "source": service.surface(participant.row)}
+
+def compression_ids(store, participant) -> tuple[str, ...]:
+    """Only the already verified participant's own compression segments."""
+    if participant.is_child:
+        resolver = _Resolver(store, allow_ended=True)
+        return tuple(segment.session_id for segment in reversed(resolver.segments(participant.row)))
+    return tuple(store.lineage.chain(participant.thread_id) or (participant.thread_id,))
+
+
+def describe(participant, *, viewer) -> dict:
+    relation = relationship(viewer, participant)
+    if relation is None:
+        raise ValueError("Participant is outside the immediate communication neighborhood")
+    result = {"session_id": participant.row.session_id, "thread_id": participant.thread_id,
+              "root_thread_id": participant.root_id, "parent_session_id": participant.parent_session_id,
+              "parent_thread_id": participant.parent_thread_id,
+              "subagent_id": participant.subagent_id, "is_child": participant.is_child,
+              "title": participant.row.title, "source": surface(participant.row),
+              "relation": relation}
+    if viewer.is_child and viewer.parent_thread_id != participant.root_id:
+        result.pop("root_thread_id")
+    # Returning a visible parent's own parent would leak a grandparent address.
+    if participant.parent_thread_id not in {None, viewer.thread_id, viewer.parent_thread_id}:
+        result["parent_session_id"] = None
+        result["parent_thread_id"] = None
+    return result

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 import time
 import uuid
@@ -40,6 +41,13 @@ def _locked(inbox: Path, *, timeout=2.0):
         raise
 
 
+def root(home):
+    inbox = home / "runtime" / "peer_messages_v2"
+    if inbox.is_symlink() or inbox.parent.is_symlink():
+        raise ValueError("Peer mailbox directory must not be a symlink")
+    return inbox
+
+
 def session_component(value: str) -> str:
     """Reject, rather than sanitize, IDs: no traversal or many-to-one aliases."""
     if not isinstance(value, str) or _SESSION_ID.fullmatch(value) is None:
@@ -53,10 +61,46 @@ def message_id(value: str) -> str:
     return value
 
 
-def _paths(inbox: Path) -> list[Path]:
+def _active_paths(inbox: Path) -> list[Path]:
     if inbox.is_symlink():
         raise ValueError("Peer inbox must not be a symlink")
     return sorted(p for p in inbox.glob("*.json") if _MESSAGE_ID.fullmatch(p.stem))
+
+
+def _archive_dir(inbox: Path) -> Path:
+    folder = inbox.parent / ".archive"
+    archived = folder / inbox.name
+    if folder.is_symlink() or archived.is_symlink():
+        raise ValueError("Peer archive must not be a symlink")
+    return archived
+
+
+def _paths(inbox: Path) -> list[Path]:
+    # Reopened conversations consume archived mail through the same FIFO.
+    archived = _archive_dir(inbox)
+    paths = {p.stem: p for p in _active_paths(archived)}
+    paths.update((p.stem, p) for p in _active_paths(inbox))
+    return [paths[key] for key in sorted(paths)]
+
+
+def archive_pending(inbox: Path) -> int:
+    """Move closed-session mail out of the active queue, never delete it."""
+    if not inbox.is_dir() or inbox.is_symlink():
+        return 0
+    with _locked(inbox, timeout=0.0):
+        paths = _active_paths(inbox)
+        if not paths:
+            return 0
+        archived = _archive_dir(inbox)
+        archived.mkdir(mode=0o700, parents=True, exist_ok=True)
+        moved = 0
+        for path in paths:
+            target = archived / path.name
+            if path.is_symlink() or target.exists() or target.is_symlink():
+                continue
+            os.replace(path, target)
+            moved += 1
+        return moved
 
 
 def _load(path: Path) -> dict[str, Any] | None:
@@ -117,7 +161,8 @@ def enqueue(inbox: Path, *, sender: str, target: str, text: str,
         if len(_paths(inbox)) >= MAX_PENDING_MESSAGES:
             raise ValueError("Target inbox is full; its recipient must read and acknowledge messages")
         key = f"{time.time_ns():020d}_{uuid.uuid4().hex[:8]}"
-        while (inbox / f"{key}.json").exists():
+        archived = _archive_dir(inbox)
+        while (inbox / f"{key}.json").exists() or (archived / f"{key}.json").exists():
             key = f"{time.time_ns():020d}_{uuid.uuid4().hex[:8]}"
         entry = {"message_id": key, "from_session_id": sender, "target_session_id": target,
                  "message": text.strip(), "sent_at": time.time(), "in_reply_to": in_reply_to}
@@ -174,17 +219,24 @@ def acknowledge(inbox: Path, ids: list[str], *, lock_timeout=2.0) -> dict[str, A
     acknowledged, failed = set(), set()
     if inbox.is_symlink():
         raise ValueError("Peer inbox must not be a symlink")
+    archived = _archive_dir(inbox)
+    if archived.is_dir() and not inbox.exists():
+        # A user may remove an empty active directory after archival. Recreate
+        # only the lock's directory, not any acknowledged envelope.
+        inbox.mkdir(mode=0o700, parents=True, exist_ok=True)
     if inbox.is_dir():
         with _locked(inbox, timeout=lock_timeout):
             for key in wanted:
-                path = inbox / f"{key}.json"
-                try:
-                    path.unlink()
-                    acknowledged.add(key)
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    failed.add(key)
-                    logger.debug("peer inbox: acknowledgement failed for %s", key, exc_info=True)
+                for folder in (inbox, archived):
+                    path = folder / f"{key}.json"
+                    try:
+                        path.unlink()
+                        acknowledged.add(key)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        failed.add(key)
+                        logger.debug("peer inbox: acknowledgement failed for %s", key, exc_info=True)
+    acknowledged.difference_update(failed)
     return {"success": not failed, "acknowledged": sorted(acknowledged),
             "not_pending": sorted(set(wanted) - acknowledged - failed), "failed": sorted(failed)}

@@ -246,10 +246,10 @@ def test_missing_read_does_not_create_mailbox(tmp_path):
     assert not inbox.exists()
 
 
-def test_legacy_envelope_without_identity_is_not_accepted(tmp_path):
+def test_envelope_without_identity_is_not_accepted(tmp_path):
     key = "00000000000000000001_abcde123"
     path = tmp_path / f"{key}.json"
-    path.write_text(json.dumps({"from_session_id": "sender", "message": "legacy", "sent_at": 1.0}), encoding="utf-8")
+    path.write_text(json.dumps({"from_session_id": "sender", "message": "invalid", "sent_at": 1.0}), encoding="utf-8")
     assert box.read_pending(tmp_path)["messages"] == []
     assert not path.exists()
 
@@ -286,3 +286,33 @@ def test_symlink_inbox_cannot_redirect_to_neighbor(tmp_path):
     with pytest.raises(ValueError):
         _send(link)
     assert not list(target.iterdir())
+
+
+def test_archived_envelopes_share_fifo_capacity_and_ack_with_active_mail(tmp_path):
+    inbox = tmp_path / "recipient"
+    first = _send(inbox, "archived")
+    assert box.archive_pending(inbox) == 1
+    archived = tmp_path / ".archive" / "recipient" / f"{first['message_id']}.json"
+    assert archived.is_file()
+    assert not (inbox / archived.name).exists()
+    assert box.archive_pending(inbox) == 0
+    second = _send(inbox, "new")
+    assert box.read_pending(inbox)["messages"] == [first, second]
+    assert box.acknowledge(inbox, [first["message_id"]])["acknowledged"] == [first["message_id"]]
+    assert not archived.exists()
+    assert box.read_pending(inbox)["messages"] == [second]
+
+
+def test_archive_does_not_bypass_pending_cap_or_lose_mail_after_empty_directory_removed(tmp_path):
+    inbox = tmp_path / "recipient"
+    sent = [_send(inbox, f"mail {i}") for i in range(box.MAX_PENDING_MESSAGES)]
+    assert box.archive_pending(inbox) == len(sent)
+    assert box.read_pending(inbox)["pending_count"] == len(sent)
+    with pytest.raises(ValueError, match="full"):
+        _send(inbox, "above combined cap")
+    # Simulate manual removal of only the empty active inbox and its lock.
+    import shutil
+    shutil.rmtree(inbox)
+    assert box.read_pending(inbox)["messages"] == sent[:box.MAX_READ_MESSAGES]
+    assert box.acknowledge(inbox, [sent[0]["message_id"]])["acknowledged"] == [sent[0]["message_id"]]
+    assert box.read_pending(inbox)["pending_count"] == len(sent) - 1
