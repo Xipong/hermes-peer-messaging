@@ -5,6 +5,8 @@ from contextvars import copy_context
 from importlib import import_module
 from types import SimpleNamespace
 
+import pytest
+
 from persistence.conversation.sessions import NewSession
 from persistence_assembly import open_persistence, open_persistence_reader, profile_scope
 
@@ -217,3 +219,132 @@ def test_awareness_observes_old_live_owners_without_waiting_for_registry_writer(
         assert registry.read_bytes() == before and registry.stat().st_mtime_ns == modified
     finally:
         lease.release()
+
+
+def test_agents_share_candidate_scans_but_explicit_directory_refreshes_once(install, monkeypatch):
+    service = import_module("peer-messaging.service")
+    teams = import_module("peer-messaging.teams")
+    from test_team_delivery import add_child
+
+    readers = ["sender", "recipient"] + [f"worker-{index}" for index in range(8)]
+    with open_persistence(profile_scope(home=install)) as store:
+        for sid in readers[2:]:
+            add_child(store, sid, "sender")
+    for sid in readers:
+        pin(install, sid, ("peer_sessions",))
+    clock = [100.0]
+    monkeypatch.setattr(service, "time", SimpleNamespace(monotonic=lambda: clock[0], time=service.time.time))
+    with open_persistence_reader(install) as store:
+        repository = type(store.sessions)
+    real_list, real_owners, real_resolve = repository.list_sessions, service.owners, teams.resolve
+    counts = {"scans": 0, "owners": 0, "identities": 0}
+
+    def counted_list(*args, **kwargs):
+        counts["scans"] += 1
+        return real_list(*args, **kwargs)
+
+    def counted_owners(*args, **kwargs):
+        counts["owners"] += 1
+        return real_owners(*args, **kwargs)
+
+    def counted_resolve(*args, **kwargs):
+        counts["identities"] += 1
+        return real_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(repository, "list_sessions", counted_list)
+    monkeypatch.setattr(service, "owners", counted_owners)
+    monkeypatch.setattr(teams, "resolve", counted_resolve)
+    for sid in readers:
+        observed = service.InboxNotices().after_tool(
+            tool_name="work", result='{"success": true}', session_id=sid, turn_id="batch",
+        )
+        assert observed is not None
+    assert counts["scans"] == 2 and counts["owners"] == 1, counts
+    # Fresh identity/authorization resolution deliberately remains per caller.
+    assert counts["identities"] > len(readers)
+
+    with open_persistence(profile_scope(home=install)) as store:
+        store.sessions.create(NewSession("late-parent", "cli", cwd="/project/new", git_repo_root="/project"))
+    listed = service.sessions({}, "recipient")
+    assert "late-parent" in {peer["session_id"] for peer in listed["peers"]}
+    assert counts["scans"] == 4 and counts["owners"] == 2
+    transformed = service.InboxNotices().after_tool(
+        tool_name="peer_sessions", result=json.dumps(listed), session_id="recipient", turn_id="explicit",
+    )
+    assert transformed is None
+    assert counts["scans"] == 4 and counts["owners"] == 2
+    clock[0] += service.DISCOVERY_INTERVAL
+    service.InboxNotices().after_tool(
+        tool_name="work", result='{"success": true}', session_id="sender", turn_id="later",
+    )
+    assert counts["scans"] == 6 and counts["owners"] == 3
+
+
+def test_cached_roster_rechecks_visibility_and_link_revocation(install, monkeypatch):
+    service = import_module("peer-messaging.service")
+    from test_team_delivery import add_child
+
+    with open_persistence(profile_scope(home=install)) as store:
+        for sid, parent in (("reader", "sender"), ("sibling", "sender"), ("other-child", "recipient")):
+            add_child(store, sid, parent)
+    pin(install, "reader", ("peer_sessions",))
+    assert call("link_thread", "sender", thread_id="recipient")["success"]
+    assert call("link_thread", "recipient", thread_id="sender")["status"] == "linked"
+    monkeypatch.setattr(service, "time", SimpleNamespace(monotonic=lambda: 100.0, time=service.time.time))
+
+    def directory(turn):
+        result = service.InboxNotices().after_tool(
+            tool_name="work", result='{"success": true}', session_id="reader", turn_id=turn,
+        )
+        return {peer["session_id"] for peer in json.loads(result)["_peer_roster"]["peers"]}
+
+    assert {"sibling", "other-child", "recipient"} <= directory("linked")
+    with open_persistence(profile_scope(home=install)) as store:
+        store.sessions.set_hidden("sibling", True)
+    assert call("link_thread", "sender", thread_id="recipient", action="unlink")["success"]
+    assert directory("revoked") == {"sender"}
+    assert not call("peer_send", "reader", target_session_id="other-child", message="forbidden")["success"]
+
+
+@pytest.mark.parametrize("compressed", [False, True], ids=["original-parents", "compressed-parents"])
+def test_compact_roster_prioritizes_both_parents_without_peer_text(install, compressed):
+    service = import_module("peer-messaging.service")
+    from test_team_delivery import add_child
+
+    with open_persistence(profile_scope(home=install)) as store:
+        add_child(store, "parent-child", "sender")
+        parent, root = "parent-child", "sender"
+        if compressed:
+            store.sessions.end(parent, "compression")
+            store.sessions.create(NewSession("parent-middle", "subagent", parent_session_id=parent,
+                                             model_config={"_delegate_from": "sender", "_subagent_id": "task-parent-child"}))
+            parent = "parent-middle"
+        add_child(store, "reader", parent)
+        if compressed:
+            # The child was delegated from a middle segment, so neither its
+            # stored parent edge nor the parent's stable thread ID names the tip.
+            store.sessions.end(parent, "compression")
+            store.sessions.create(NewSession("parent-tip", "subagent", parent_session_id=parent,
+                                             model_config={"_delegate_from": "sender", "_subagent_id": "task-parent-child"}))
+            store.sessions.end("sender", "compression")
+            store.sessions.create(NewSession("sender-tip", "cli", parent_session_id="sender"))
+            parent, root = "parent-tip", "sender-tip"
+        for index in range(12):
+            add_child(store, f"recent-{index}", "sender")
+        store.sessions.set_title("sender", "peer-controlled-request")
+    pin(install, "reader", ("peer_sessions",))
+    context = start("reader", "roster-turn", platform="subagent")
+    assert context == service.DISCOVERY_HINT and "peer-controlled-request" not in context
+    result = tool("reader", "roster-turn", "list_threads")
+    roster = result["_peer_roster"]
+    assert roster["authority"] == "peer_data" and roster["has_more"]
+    assert {peer["session_id"] for peer in roster["peers"][:2]} == {root, parent}
+    assert 2 < len(roster["peers"]) <= 8
+    assert len(json.dumps(roster, separators=(",", ":"))) <= 4096
+    assert all(set(peer) == {"session_id", "role", "root_thread_id", "parent_session_id", "subagent_id"}
+               for peer in roster["peers"])
+    assert next(peer for peer in roster["peers"] if peer["session_id"] == parent)["subagent_id"] == "task-parent-child"
+    assert "peer-controlled-request" not in json.dumps(result)
+    assert "_peer_roster" not in tool("reader", "roster-turn", "list_threads")
+    assert call("peer_send", "reader", target_session_id=roster["peers"][0]["session_id"],
+                message="addressed without directory lookup")["status"] == "queued"

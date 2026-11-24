@@ -261,10 +261,15 @@ def read_thread(args, sid):
 
 
 def wait_threads(args, sid):
+    # Keep old frozen pins callable, but never schedule a wait from their arguments.
+    unknown = set(args) - {"threads", "wait_seconds"}
+    if unknown:
+        raise ValueError("Unknown wait_threads argument(s): " + ", ".join(sorted(unknown)))
     targets = args.get("threads")
-    wait = args.get("wait_seconds", 15)
+    wait = args.get("wait_seconds", 0)
     if not isinstance(targets, list) or not 1 <= len(targets) <= 5 or type(wait) not in (float, int) or not 0 <= wait <= 30:
-        raise ValueError("Supply 1–5 threads and wait_seconds between 0 and 30")
+        raise ValueError("Supply 1–5 threads; legacy wait_seconds must be between 0 and 30 and is ignored")
+    compatibility = {"wait_seconds_ignored": True} if "wait_seconds" in args else {}
     cursors = {}
     for item in targets:
         if not isinstance(item, dict) or set(item) - {"thread_id", "after_row_id"}:
@@ -275,53 +280,43 @@ def wait_threads(args, sid):
             raise ValueError("Use unique thread IDs and non-negative after_row_id values")
         cursors[target] = after
     home = get_hermes_home()
-    deadline = time.monotonic() + wait
-    cached = {}
-    while True:
-        with graph(home) as links, open_persistence_reader(home) as store:
-            own_id, own = locate(store, sid)
-            ready, pending, closed, limited = [], [], [], []
-            for target, cursor in cursors.items():
-                other_id, row, since = linked(store, links, own_id, own, target, allow_ended=True)
-                # The row's transcript_revision tracks rewrites, not appends.
-                # The public fingerprint also changes when a new final is saved.
-                cursor_key = (row.session_id, store.messages.conversation_revision(row.session_id), since)
-                if target not in cached or cached[target][0] != cursor_key:
-                    observation = recent(store, row, since, limit=1, after=cursor, roles=("assistant",))
-                    cached[target] = (cursor_key, observation)
-                else:
-                    observation = cached[target][1]
-                final = next(iter(observation["messages"]), None)
-                if observation["scan_limited_roles"]:
-                    limited.append(other_id)
-                if final:
-                    ready.append({"thread_id": other_id, "session_id": row.session_id, "result": final})
-                elif row.ended_at is not None:
-                    closed.append(other_id)
-                else:
-                    pending.append(other_id)
-        remaining = deadline - time.monotonic()
-        if ready or not pending or remaining <= 0:
-            status = "ready" if ready else "scan_limit" if limited else "timeout" if pending else "closed"
-            return {"success": True, "authority": "peer_data", "status": status, "ready": ready,
-                    "pending": pending, "closed": closed, "scan_limited": limited, "scan_limit_per_role": _SCAN,
-                    "note": "Saved finals in the current segment only. scan_limited names incomplete scans; no chat was started."}
-        time.sleep(min(0.75, remaining))
+    with graph(home) as links, open_persistence_reader(home) as store:
+        own_id, own = locate(store, sid)
+        ready, pending, closed, limited = [], [], [], []
+        for target, cursor in cursors.items():
+            other_id, row, since = linked(store, links, own_id, own, target, allow_ended=True)
+            observation = recent(store, row, since, limit=1, after=cursor, roles=("assistant",))
+            final = next(iter(observation["messages"]), None)
+            if observation["scan_limited_roles"]:
+                limited.append(other_id)
+            if final:
+                ready.append({"thread_id": other_id, "session_id": row.session_id, "result": final})
+            elif row.ended_at is not None:
+                closed.append(other_id)
+            else:
+                pending.append(other_id)
+    status = "ready" if ready else "scan_limit" if limited else "pending" if pending else "closed"
+    return {"success": True, "authority": "peer_data", "status": status, "ready": ready,
+            "pending": pending, "closed": closed, "scan_limited": limited, "scan_limit_per_role": _SCAN,
+            **compatibility,
+            "note": "Immediate snapshot of saved finals in the current segment; pending is not a running-turn status. "
+                    "scan_limited names incomplete scans. Continue your task instead of polling; mail arrives with ordinary tool results. "
+                    "Native delegate_task reports child completion. No chat was started."}
 
 
 def register(ctx):
-    def add(name, operation, description, properties, required=()):
+    def add(name, operation, description, properties, required=(), *, legacy_args=False):
         ctx.register_tool(name=name, toolset=service.TOOLSET, check_fn=service.requirements,
                           handler=service.handler(operation), emoji="🧵", schema={"name": name,
                               "description": description, "parameters": {"type": "object", "properties": properties,
-                              "required": list(required), "additionalProperties": False}})
+                              "required": list(required), "additionalProperties": legacy_args}})
     id_field = {"type": "string", "description": "Exact thread_id or current session_id"}
     add("list_threads", list_threads, "List your team's directly linked local parent chats and pending offers. Delegated agents inherit their root parent's directory. No wake.", {})
     add("link_thread", link, "For independent local parents in one profile: propose or revoke a link between teams. Both must offer; links are not transitive. Linked teams can message each other across projects. Only links formed in the same project can share new public parent text. No prompt is sent.",
         {"thread_id": id_field, "action": {"type": "string", "enum": ["offer", "unlink"]}}, ("thread_id",))
     add("read_thread", read_thread, "For independent parents: read bounded public text after a shared-transcript link in the same project. Mail-only links do not grant access. Delegated agents receive mail as peer_data with their tool results. scan_limited_roles reports incomplete scans. No raw tool results, reasoning, or wake.",
         {"thread_id": id_field, "limit": {"type": "integer", "minimum": 1, "maximum": 10}}, ("thread_id",))
-    add("wait_threads", wait_threads, "For independent parents: wait up to 30 seconds for a same-project parent's saved final newer than the cursor on a shared-transcript link. Mail replies arrive as peer_data with ordinary tool results; do not use this to poll the inbox or track child completion. scan_limit reports an incomplete search. Does not launch or resume anyone.",
+    add("wait_threads", wait_threads, "For independent parents: take one immediate snapshot of saved finals newer than the cursor on same-project shared-transcript links. Never waits. pending means no saved final was found, not that a turn is running. Continue your task instead of polling. Mail arrives as peer_data with ordinary tool results; native delegate_task reports child completion. scan_limit reports an incomplete search. Does not launch or resume anyone.",
         {"threads": {"type": "array", "minItems": 1, "maxItems": 5, "items": {"type": "object", "properties": {
-            "thread_id": id_field, "after_row_id": {"type": "integer", "minimum": 0}}, "required": ["thread_id"], "additionalProperties": False}},
-         "wait_seconds": {"type": "number", "minimum": 0, "maximum": 30}}, ("threads",))
+            "thread_id": id_field, "after_row_id": {"type": "integer", "minimum": 0}}, "required": ["thread_id"], "additionalProperties": False}}},
+        ("threads",), legacy_args=True)

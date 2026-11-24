@@ -122,6 +122,39 @@ def test_bounded_read_and_ack_expose_next_page(tmp_path):
     assert box.read_pending([tmp_path])["messages"] == items[box.MAX_READ_MESSAGES:]
 
 
+def test_read_loads_only_requested_fifo_page_across_inboxes(tmp_path, monkeypatch):
+    inboxes = [tmp_path / "old-segment", tmp_path / "current-segment"]
+    items = [_send(inboxes[number % 2], str(number)) for number in range(50)]
+    loaded = []
+    load = box._load
+
+    def observe(path):
+        loaded.append(path.stem)
+        return load(path)
+
+    monkeypatch.setattr(box, "_load", observe)
+    page = box.read_pending(list(reversed(inboxes)))
+    assert page["messages"] == items[:5]
+    assert loaded == [item["message_id"] for item in items[:5]]
+    assert page["has_more"] is True and page["pending_count"] == 50
+    assert page["pending_count_is_exact"] is False
+
+
+def test_uninspected_tail_is_reported_until_its_page_is_validated(tmp_path):
+    items = [_send(tmp_path, str(number)) for number in range(6)]
+    poison = tmp_path / f"{items[-1]['message_id']}.json"
+    poison.write_bytes(b"{")
+    first = box.read_pending([tmp_path])
+    assert first["messages"] == items[:5]
+    assert first["has_more"] and first["pending_count"] == 6
+    assert first["pending_count_is_exact"] is False and poison.exists()
+    box.acknowledge([tmp_path], [item["message_id"] for item in first["messages"]])
+    last = box.read_pending([tmp_path])
+    assert last["messages"] == [] and last["pending_count"] == 0
+    assert last["pending_count_is_exact"] is True and not last["has_more"]
+    assert not poison.exists()
+
+
 def test_concurrent_processes_cannot_overfill_or_overwrite(tmp_path):
     jobs = [(str(tmp_path), n) for n in range(box.MAX_PENDING_MESSAGES + 8)]
     with ProcessPoolExecutor(max_workers=4, mp_context=multiprocessing.get_context("spawn")) as pool:

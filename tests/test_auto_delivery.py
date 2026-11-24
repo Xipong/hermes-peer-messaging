@@ -282,6 +282,54 @@ def test_batches_keep_complete_bodies_and_do_not_duplicate_one_tool_batch(instal
     assert json.loads(followup)["peer_data"]["messages"]
 
 
+@pytest.mark.parametrize("truncated", [False, True])
+def test_explicit_receive_deduplicates_prepared_batch_but_keeps_unproven_mail(install, truncated):
+    service = import_module("peer-messaging.service")
+    body = "A finding carried once in this batch"
+    key = queue(body)
+    with open_persistence(profile_scope(home=install)) as store:
+        store.sessions.update_tool_pin("recipient", {"tools": ["peer_receive"]})
+    delivery = new_delivery()
+    notices = service.InboxNotices(delivery)
+    args = dict(session_id="recipient", turn_id="active-turn", api_request_id="producing-request")
+    first = notices.after_tool(tool_name="work", result='{"output":"done"}', tool_call_id="work-call", **args)
+    second = notices.after_tool(tool_name="peer_receive", result=json.dumps(call("peer_receive", "recipient")),
+                                tool_call_id="read-call", **args)
+    assert body in first
+    assert second is not None and body not in second
+    assert json.loads(second)["peer_delivery"]["message_ids"] == [key]
+    assert pending(install)["messages"][0]["message_id"] == key
+
+    actual = '{"output":"truncated"}' if truncated else first
+    rows = [persist(install, tool_row(actual)), persist(install, tool_row(second, "read-call"))]
+    prepare(delivery, rows, [tool_row(actual), tool_row(second, "read-call")])
+    complete(delivery)
+    if truncated:
+        assert pending(install)["messages"][0]["message_id"] == key
+        retry = notices.after_tool(tool_name="work", result='{"output":"next batch"}',
+                                   tool_call_id="retry-call", **args)
+        assert json.loads(retry)["peer_data"]["messages"][0]["message_id"] == key
+    else:
+        assert pending(install)["messages"] == []
+
+
+def test_explicit_receive_tracks_new_mail_after_a_prepared_carrier(install):
+    first_key = queue("first finding")
+    delivery = new_delivery()
+    first = attach(delivery, install)
+    second_key = queue("late finding")
+    snapshot = pending(install)
+    second = delivery.attach('{"success":true}', session_id="recipient", turn_id="active-turn",
+                             api_request_id="producing-request", tool_call_id="read-call", explicit=True,
+                             inboxes=[inbox(install)], messages=snapshot["messages"], has_more=snapshot["has_more"])
+    assert [item["message_id"] for item in json.loads(second)["peer_data"]["messages"]] == [second_key]
+    assert first_key not in second
+    rows = [persist(install, tool_row(first)), persist(install, tool_row(second, "read-call"))]
+    prepare(delivery, rows, [tool_row(first), tool_row(second, "read-call")])
+    complete(delivery)
+    assert pending(install)["messages"] == []
+
+
 def test_one_large_escaped_envelope_remains_deliverable_without_truncation(install):
     box = import_module("peer-messaging.mailbox")
     body = "\x01" * box.MAX_MESSAGE_CHARS

@@ -129,7 +129,7 @@ class InboxDelivery:
             return key is not None and key not in self.batches
 
     def attach(self, result: str, *, session_id, turn_id, api_request_id="", tool_call_id,
-               inboxes: list[Path], messages: list[dict], has_more=False) -> str | None:
+               inboxes: list[Path], messages: list[dict], has_more=False, explicit=False) -> str | None:
         key = self._batch_key(session_id, turn_id, api_request_id, tool_call_id)
         if key is None or not isinstance(result, str) or not messages or not inboxes:
             return None
@@ -140,32 +140,45 @@ class InboxDelivery:
         else:
             if not isinstance(payload, dict) or "peer_data" in payload:
                 return None
-        delivery_id = uuid.uuid4().hex
-        data = {"authority": "peer_data", "delivery_id": delivery_id,
-                "messages": [], "has_more": True, "note": NOTE}
-        for entry in messages[:mailbox.MAX_READ_MESSAGES]:
-            candidate = {**data, "messages": [*data["messages"], entry]}
-            size = len(_canonical(candidate))
-            if size > MAX_DELIVERY_CHARS:
-                # One legal envelope may expand under JSON control-character
-                # escaping. Keep it whole rather than starving this oldest mail.
-                if not data["messages"] and size <= mailbox.MAX_ENVELOPE_BYTES:
-                    data = candidate
-                break
-            data = candidate
-        if not data["messages"]:
-            return None
-        data["has_more"] = bool(has_more or len(data["messages"]) < len(messages))
-        block = _canonical(data)
-        ids = tuple(mailbox.message_id(entry["message_id"]) for entry in data["messages"])
-        carrier = _Carrier(get_hermes_home(), session_id, turn_id, tool_call_id, delivery_id,
-                           block, tuple(Path(inbox) for inbox in inboxes), ids)
-        transformed = (_canonical({**payload, "peer_data": data}) if payload is not None else
-                       result + "\n\n[peer-messaging]\n" + block)
         with self.lock:
-            if key in self.batches:
+            if key in self.batches and not explicit:
                 return None
-            self._put(self.batches, key, delivery_id)
+            previous = tuple(item for item in self.batches.get(key, ()) if item in self.carriers)
+            prepared = {message_id for item in previous for message_id in self.carriers[item].message_ids}
+            fresh = [entry for entry in messages if entry["message_id"] not in prepared]
+            if not fresh:
+                # This is only batch-local coalescing, never evidence of receipt.
+                # A missing/truncated earlier carrier still retries after the
+                # request boundary releases this batch and leaves mail queued.
+                status = {"status": "already_attached",
+                          "message_ids": list(dict.fromkeys(entry["message_id"] for entry in messages)),
+                          "note": "These IDs are already attached to another result in this tool batch. "
+                                  "Delivery is still pending verification; continue your task without polling."}
+                return (_canonical({**payload, "peer_delivery": status}) if payload is not None else
+                        result + "\n\n[peer-messaging]\n" + _canonical(status))
+            delivery_id = uuid.uuid4().hex
+            data = {"authority": "peer_data", "delivery_id": delivery_id,
+                    "messages": [], "has_more": True, "note": NOTE}
+            for entry in fresh[:mailbox.MAX_READ_MESSAGES]:
+                candidate = {**data, "messages": [*data["messages"], entry]}
+                size = len(_canonical(candidate))
+                if size > MAX_DELIVERY_CHARS:
+                    # One legal envelope can expand when JSON escapes control
+                    # characters; keep it whole instead of starving oldest mail.
+                    if not data["messages"] and size <= mailbox.MAX_ENVELOPE_BYTES:
+                        data = candidate
+                    break
+                data = candidate
+            if not data["messages"]:
+                return None
+            data["has_more"] = bool(has_more or len(data["messages"]) < len(fresh))
+            block = _canonical(data)
+            ids = tuple(mailbox.message_id(entry["message_id"]) for entry in data["messages"])
+            carrier = _Carrier(get_hermes_home(), session_id, turn_id, tool_call_id, delivery_id,
+                               block, tuple(Path(inbox) for inbox in inboxes), ids)
+            transformed = (_canonical({**payload, "peer_data": data}) if payload is not None else
+                           result + "\n\n[peer-messaging]\n" + block)
+            self._put(self.batches, key, (*previous, delivery_id))
             self._put(self.carriers, delivery_id, carrier)
         return transformed
 

@@ -1,7 +1,9 @@
 """V2 contracts use temporary native Hermes profiles and its tool dispatcher."""
 import time
+from copy import deepcopy
 from importlib import import_module
-from types import SimpleNamespace
+
+import pytest
 
 from persistence.conversation.messages import NewMessage
 from persistence.conversation.sessions import NewSession
@@ -68,20 +70,20 @@ def test_unlink_accepts_the_ended_current_segment_id(install):
 def test_message_and_wait_never_start_a_thread(install):
     connect()
     first = ok("wait_threads", "sender", threads=[{"thread_id": "recipient"}], wait_seconds=0)
-    assert first["status"] == "timeout" and first["pending"] == ["recipient"]
+    assert first["status"] == "pending" and first["pending"] == ["recipient"]
     queued = ok("peer_send", "sender", target_session_id="recipient", message="coordination, not a prompt")
     assert queued["status"] == "queued"
     with open_persistence_reader(install) as store:
         assert all(store.sessions.get(i).message_count == 0 for i in ("recipient", "elsewhere"))
     assert ok("peer_receive", "recipient")["messages"][0]["message_id"] == queued["message_id"]
     append(install, "recipient", "assistant", "partial", finish_reason="length")
-    assert ok("wait_threads", "sender", threads=[{"thread_id": "recipient"}], wait_seconds=0)["status"] == "timeout"
+    assert ok("wait_threads", "sender", threads=[{"thread_id": "recipient"}], wait_seconds=0)["status"] == "pending"
     append(install, "recipient", "assistant", "result", finish_reason="stop")
     ready = ok("wait_threads", "sender", threads=[{"thread_id": "recipient"}], wait_seconds=0)
     result = ready["ready"][0]["result"]
     assert ready["status"] == "ready" and result["text"] == "result"
     assert ok("wait_threads", "sender", threads=[{"thread_id": "recipient", "after_row_id": result["row_id"]}],
-              wait_seconds=0)["status"] == "timeout"
+              wait_seconds=0)["status"] == "pending"
     with open_persistence(profile_scope(home=install)) as store:
         store.sessions.end("recipient", "agent_close")
     assert ok("read_thread", "sender", thread_id="recipient")["ended_at"] is not None
@@ -91,25 +93,46 @@ def test_message_and_wait_never_start_a_thread(install):
     assert closed["status"] == "closed" and closed["closed"] == ["recipient"]
 
 
-def test_wait_observes_a_final_saved_after_polling_started(install, monkeypatch):
+@pytest.mark.parametrize("deferred", [False, True], ids=["direct", "tool_call"])
+def test_wait_is_one_snapshot_even_with_a_legacy_pin(install, monkeypatch, deferred):
+    from model_tools import get_tool_definitions
+
     connect()
-    threads = import_module("peer-messaging.threads")
-    clock = [0.0]
-    saved = []
+    definitions = get_tool_definitions(enabled_toolsets=["peer_messaging"],
+                                       skip_tool_search_assembly=True, quiet_mode=True)
+    advertised = next(tool for tool in definitions if tool["function"]["name"] == "wait_threads")
+    legacy = deepcopy(advertised)
+    legacy["function"]["parameters"]["properties"]["wait_seconds"] = {
+        "type": "number", "minimum": 0, "maximum": 30, "default": 15,
+    }
+    with open_persistence(profile_scope(home=install)) as store:
+        store.sessions.update_tool_pin("sender", {"tools": [legacy]})
 
-    def finish_during_wait(seconds):
-        if not saved:
-            saved.append(append(install, "recipient", "assistant", "finished during the wait", finish_reason="stop"))
-        clock[0] += seconds
+    def no_sleep(_seconds):
+        pytest.fail("wait_threads must return one snapshot without waiting for a saved final")
 
-    monkeypatch.setattr(threads, "time", SimpleNamespace(
-        time=time.time, monotonic=lambda: clock[0], sleep=finish_during_wait,
-    ))
-    result = threads.wait_threads({"threads": [{"thread_id": "recipient"}], "wait_seconds": 1}, "sender")
-    assert saved, "The final must be persisted after the first poll"
-    assert result["status"] == "ready", result
-    assert result["ready"][0]["result"]["text"] == "finished during the wait"
-    assert result["pending"] == []
+    def observe(**args):
+        if deferred:
+            return call("tool_call", "sender", calls=[{"name": "wait_threads", "arguments": args}])
+        return call("wait_threads", "sender", **args)
+
+    monkeypatch.setattr(time, "sleep", no_sleep)
+    empty = observe(threads=[{"thread_id": "recipient"}], wait_seconds=30)
+    assert empty.get("success") and empty["status"] == "pending", empty
+    assert empty["pending"] == ["recipient"] and empty["wait_seconds_ignored"] is True
+
+    append(install, "recipient", "assistant", "saved after the first snapshot", finish_reason="stop")
+    ready = observe(threads=[{"thread_id": "recipient"}])
+    assert ready["status"] == "ready" and ready["ready"][0]["result"]["text"] == "saved after the first snapshot"
+    assert "wait_seconds_ignored" not in ready
+    latest = ready["ready"][0]["result"]["row_id"]
+    pending = observe(threads=[{"thread_id": "recipient", "after_row_id": latest}])
+    assert pending["status"] == "pending" and pending["ready"] == []
+
+    for args in ({"current_session_id": "recipient"}, {"wait_second": 30}, {"wait_seconds": True}):
+        refused = observe(threads=[{"thread_id": "recipient"}], **args)
+        assert refused.get("success") is False and "error" in refused, refused
+    assert "wait_seconds" not in advertised["function"]["parameters"]["properties"]
 
 
 def test_tool_traffic_does_not_hide_a_saved_final(install):
