@@ -17,7 +17,7 @@ from persistence.conversation.sessions import (
 from persistence_assembly import open_persistence_reader, profile_scope, store_exists
 
 from . import mailbox
-from .discovery import CandidateCache, scan
+from .discovery import CandidateCache, family_candidates, scan
 
 LOG = logging.getLogger(__name__)
 LOCAL = frozenset({"cli", "tui", "desktop", "gui"})
@@ -77,6 +77,24 @@ def route(store, sid, *, follow=False, allow_ended=False) -> SessionRecord:
     return previous
 
 
+def locate(store, sid, *, allow_ended=False):
+    tip = route(store, sid, follow=True, allow_ended=allow_ended)
+    first = tip
+    seen = {tip.session_id}
+    while first.parent_session_id and first.parent_session_id not in seen:
+        parent = store.sessions.get(mailbox.session_component(first.parent_session_id))
+        if not parent or parent.end_reason != "compression":
+            break
+        try:
+            if route(store, parent.session_id, follow=True, allow_ended=allow_ended).session_id != tip.session_id:
+                break
+        except ValueError:
+            break
+        seen.add(parent.session_id)
+        first = parent
+    return first.session_id, tip
+
+
 def receive_scope(home, sid, *, patience_s=0.1):
     from . import teams
 
@@ -110,7 +128,7 @@ def owners(home):
         return None
 
 
-def discover(store, own, links, *, cutoff, same=True, scope="all", index=None,
+def discover(store, own, *, cutoff, same=True, scope="all", index=None,
              live_owners=None, snapshot=None):
     """Explicit directory: scope changes selection, never routing permission."""
     from . import teams
@@ -119,7 +137,9 @@ def discover(store, own, links, *, cutoff, same=True, scope="all", index=None,
     index = index if index is not None else ProjectIndex(get_hermes_home())
     key = project(own.root, index=index) if same else None
     peers, seen = [], {own.row.session_id}
-    snapshot = snapshot if snapshot is not None else scan(store, live_owners, roots_only=scope == "roots")
+    include_roots = not own.is_child and scope in {"roots", "all"}
+    if include_roots and snapshot is None:
+        snapshot = scan(store, live_owners)
     live_owners = live_owners or ()
 
     def add(candidate, *, last_active=None, ancestor=False):
@@ -135,7 +155,7 @@ def discover(store, own, links, *, cutoff, same=True, scope="all", index=None,
         own_team = participant.root_id == own.root_id
         if scope == "team" and not own_team:
             return
-        if not teams.allowed(own, participant, links):
+        if not teams.allowed(own, participant):
             return
         if same and not own_team and (key is None or project(participant.root, index=index) != key):
             return
@@ -151,14 +171,18 @@ def discover(store, own, links, *, cutoff, same=True, scope="all", index=None,
 
     if own.is_child:
         add(own.parent_session_id, ancestor=True)
-    for candidate, last_active in snapshot.candidates:
-        add(candidate, last_active=last_active)
+    if scope != "roots":
+        for candidate in family_candidates(store, own):
+            add(candidate)
+    if include_roots:
+        for candidate, last_active in snapshot.candidates:
+            add(candidate, last_active=last_active)
     peers.sort(key=lambda peer: (peer["relation"] != "peer", peer["last_active"]), reverse=True)
-    return peers, list(snapshot.limited_sources)
+    return peers, list(snapshot.limited_sources) if include_roots else []
 
 
 def sessions(args, sid):
-    from . import teams, threads
+    from . import teams, lifecycle
     from .project_identity import ProjectIndex
 
     minutes, same = args.get("active_within_minutes", 60), args.get("same_project", True)
@@ -169,24 +193,24 @@ def sessions(args, sid):
     index = ProjectIndex(home)
     with open_persistence_reader(home) as store:
         own = teams.resolve(store, sid)
-        snapshot = DISCOVERY_CACHE.get(home, store, now=time.monotonic(), max_age=DISCOVERY_INTERVAL,
-                                       owner_loader=owners, refresh=True, roots_only=scope == "roots")
-        live = snapshot.live_owners
-        peers, limited = discover(store, own, {}, cutoff=time.time() - minutes * 60, same=same,
+        snapshot = None
+        if not own.is_child and scope in {"roots", "all"}:
+            snapshot = DISCOVERY_CACHE.get(home, store, now=time.monotonic(), max_age=DISCOVERY_INTERVAL,
+                                           owner_loader=owners, refresh=True)
+        live = snapshot.live_owners if snapshot is not None else owners(home)
+        peers, limited = discover(store, own, cutoff=time.time() - minutes * 60, same=same,
                                   scope=scope, index=index, live_owners=live, snapshot=snapshot)
-        directory = []
-        if not own.is_child:
-            with threads.graph(home) as links:
-                directory = threads.directory(store, own, links)
     for peer in peers:
         peer["owner_present"] = None if live is None else peer["session_id"] in live
+    if not own.is_child:
+        lifecycle.sweep(home, live)
     return {"success": True, **teams.describe(own, viewer=own), "hermes_project_id": index.named_id(own.root),
-            "count": len(peers), "peers": peers, "links": directory, "scope": scope,
+            "count": len(peers), "peers": peers, "scope": scope,
             "same_project": same, "scan_may_be_truncated": bool(limited), "scan_limited_sources": limited}
 
 
 def send(args, sid):
-    from . import teams
+    from . import teams, lifecycle
 
     home, requested = get_hermes_home(), args.get("target_session_id")
     with open_persistence_reader(home, patience_s=0.1) as store:
@@ -202,11 +226,12 @@ def send(args, sid):
         if not teams.allowed(sender, target):
             raise ValueError("You can message only your immediate parent, direct children, or siblings with the same parent. "
                              "Independent root chats can message each other. Escalate other issues through your parent; "
-                             "root contacts do not grant access to other branches.")
+                             "other branches are not directly reachable.")
         entry = mailbox.enqueue(root(home) / target.thread_id, sender=sender.row.session_id,
                                 target=target.row.session_id, text=args.get("message"),
                                 in_reply_to=args.get("in_reply_to"))
-    return {"success": True, "status": "queued", "message_id": entry["message_id"],
+        state = lifecycle.recipient_state(store, target, owners(home))
+    return {"success": True, "status": "queued", "recipient_state": state, "message_id": entry["message_id"],
             "target_session_id": target.row.session_id, "requested_target_session_id": requested,
             "from_session_id": sender.row.session_id, "from_thread_id": sender.thread_id,
             "target_thread_id": target.thread_id}
@@ -283,8 +308,6 @@ class InboxNotices:
             return bool(pending - previous - set(carried))
 
     def _awareness(self, home, store, own, listed):
-        from . import teams, threads
-
         if not pin_has_tool(own.row.tool_pin, "peer_sessions"):
             return {}
         key = (str(home), own.thread_id)
@@ -300,38 +323,25 @@ class InboxNotices:
 
         shown = {peer["thread_id"] for peer in listed.get("peers", ())
                  if not peer["is_child"]} if listed is not None else set()
-        roots, incoming, limited = set(), set(), []
+        roots, limited = set(), []
         scan_roots = not (listed is not None and listed.get("scope") in {"roots", "all"})
         due = self._due(key, refresh=not scan_roots)
-        # Root discovery needs no graph: independent parents can always message.
+        # Only roots need automatic neighbor discovery.
         if due and scan_roots:
             snapshot = DISCOVERY_CACHE.get(home, store, now=time.monotonic(), max_age=DISCOVERY_INTERVAL,
-                                           owner_loader=owners, roots_only=True)
-            peers, limited = discover(store, own, {}, cutoff=time.time() - 3600, scope="roots",
+                                           owner_loader=owners)
+            peers, limited = discover(store, own, cutoff=time.time() - 3600, scope="roots",
                                 live_owners=snapshot.live_owners, snapshot=snapshot)
             roots = {peer["thread_id"] for peer in peers}
 
-        inspect_links = pin_has_tool(own.row.tool_pin, "link_thread")
-        if inspect_links:
-            with threads.graph(home) as links:
-                incoming = {item["thread_id"] for item in threads.directory(store, own, links, incoming_only=True)
-                            if item["session_id"] is not None
-                            and item["ended_at"] is None}
-        shown_links = {item["thread_id"] for item in listed.get("links", ())
-                       if item["link"] == "incoming"} if listed is not None else set()
         with self.lock:
-            previous = self.seen.get(key, (set(), set()))
-            known_roots, known_offers = previous
+            known_roots = self.seen.get(key, set())
             new_roots = roots - known_roots - shown
-            new_offers = incoming - known_offers - shown_links
-            self._put(self.seen, key, (known_roots | roots | shown, incoming))
-        # Report at most one small update for a burst; the full directory is explicit.
+            self._put(self.seen, key, known_roots | roots | shown)
         result = {}
         if new_roots:
             result["neighbors"] = sorted(new_roots)[:8]
-        if new_offers:
-            result["incoming_links"] = sorted(new_offers)[:8]
-        if len(new_roots) > 8 or len(new_offers) > 8 or (new_roots and limited):
+        if len(new_roots) > 8 or (new_roots and limited):
             result["has_more"] = True
         return result
 
@@ -373,7 +383,7 @@ class InboxNotices:
             read_mail = self.delivery is not None and self.delivery.can_attach(
                 session_id=session_id, turn_id=turn_id, api_request_id=api_request_id, tool_call_id=tool_call_id)
             if (self.delivery is not None and tool_call_id and not read_mail
-                    and tool_name not in {"peer_receive", "peer_sessions", "link_thread"}):
+                    and tool_name not in {"peer_receive", "peer_sessions"}):
                 return None
             update_allowed = payload is None or "peer_update" not in payload
             with open_persistence_reader(home, patience_s=0.05) as store:
@@ -434,7 +444,6 @@ def handler(operation):
 
 
 def register(ctx):
-    from . import threads
     from .delivery import InboxDelivery
 
     def tool(name, operation, description, properties, required=(), emoji="📬"):
@@ -447,7 +456,7 @@ def register(ctx):
     tool("peer_sessions", sessions,
          "Find permitted contacts: your immediate parent, direct children, and siblings with the same parent. "
          "Independent root chats also see other roots. scope=roots selects permitted roots; team selects your local family; "
-         "all includes every permitted type. same_project=false expands search, never access. Root contact offers appear in links. "
+         "all includes every permitted type. same_project=false expands root search, never access. "
          "peer_update announces new roots or your parent; has_more means consult this directory. Presence is not a running turn.", {
              "scope": {"type": "string", "enum": ["roots", "team", "all"], "default": "all"},
              "active_within_minutes": {"type": "integer", "minimum": 1, "maximum": 1440, "default": 60},
@@ -455,9 +464,10 @@ def register(ctx):
          })
     tool("peer_send", send,
          "Queue a note to a known session_id/thread_id or parent: immediate parent, direct child, same-parent sibling, "
-         "or another independent root if you are a root. Known IDs and root links do not bypass these limits. "
+         "or another independent root if you are a root. Known IDs do not bypass these limits. "
          "Escalate shared issues to your parent so coordinators can inform the affected branches. Reply with in_reply_to. "
-         "Queued is not read; never wakes the recipient. Continue your task.", {
+         "Use mail for coordination, not final summaries already returned by delegate_task. Queued is not read; "
+         "recipient_state is advisory, not proof of an executing turn. Never wakes the recipient; do not wait or poll.", {
              "target_session_id": {"type": "string", "description": "Exact address or parent (immediate delegation parent)."},
              "message": {"type": "string", "minLength": 1, "maxLength": mailbox.MAX_MESSAGE_CHARS},
              "in_reply_to": {"type": "string"},
@@ -470,13 +480,6 @@ def register(ctx):
              "message_ids": {"type": "array", "minItems": 1, "maxItems": mailbox.MAX_PENDING_MESSAGES,
                              "items": {"type": "string"}},
          }, emoji="📥")
-    tool("link_thread", threads.link,
-         "Independent root chats can offer or revoke a stable coordinator contact. Both must offer for linked status. "
-         "peer_sessions keeps these contacts outside project and activity filters. Roots can already message each other; "
-         "contacts never grant access to children or other branches, read transcripts, or wake agents.", {
-             "thread_id": {"type": "string", "description": "Exact independent thread_id or session_id"},
-             "action": {"type": "string", "enum": ["offer", "unlink"], "default": "offer"},
-         }, ("thread_id",), "🧵")
     delivery = InboxDelivery()
     notices = InboxNotices(delivery)
     ctx.register_hook("pre_llm_call", notices.before_turn)

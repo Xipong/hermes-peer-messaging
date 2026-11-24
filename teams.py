@@ -1,7 +1,7 @@
 """Durable participant identities and immediate-family communication boundaries.
 
 Subagent markers locate candidates; they never establish ownership on their own.
-Coordinators carry information between branches; a root link never admits workers.
+Coordinators carry information between branches, never opening access to foreign workers.
 """
 from __future__ import annotations
 
@@ -85,9 +85,9 @@ class _Resolver:
     def local(self, row, *, follow=True):
         # Import lazily: service dispatch uses this resolver, while the existing
         # local route remains the authority for supported conversation surfaces.
-        from . import threads
+        from . import service
 
-        root_id, current = threads.locate(self.store, row.session_id, allow_ended=self.allow_ended)
+        root_id, current = service.locate(self.store, row.session_id, allow_ended=self.allow_ended)
         if not follow and current.session_id != row.session_id:
             raise ValueError("This chat rotated; use its current session")
         current = self.get(current.session_id)
@@ -171,9 +171,16 @@ def relationship(a, b) -> str | None:
     return None
 
 
-def allowed(a, b, links=None) -> bool:
-    # Root contacts remain a directory feature, never an exception to delegation.
+def allowed(a, b) -> bool:
     return relationship(a, b) not in {None, "self"}
+
+
+def compression_ids(store, participant) -> tuple[str, ...]:
+    """Only the already verified participant's own compression segments."""
+    if participant.is_child:
+        resolver = _Resolver(store, allow_ended=True)
+        return tuple(segment.session_id for segment in reversed(resolver.segments(participant.row)))
+    return tuple(store.lineage.chain(participant.thread_id) or (participant.thread_id,))
 
 
 def describe(participant, *, viewer=None) -> dict:

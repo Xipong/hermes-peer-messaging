@@ -64,25 +64,6 @@ def test_mail_arriving_after_ack_still_announces_itself_in_the_same_turn(install
         assert store.sessions.get("recipient").message_count == 0
 
 
-def test_offer_arriving_after_directory_is_not_suppressed(install):
-    threads = import_module("peer-messaging.threads")
-    service = import_module("peer-messaging.service")
-    notices = tracker(install, "peer_sessions", "link_thread")
-    listed = service.sessions({}, "recipient")
-    assert listed["links"] == []
-    assert threads.link({"thread_id": "recipient"}, "sender")["status"] == "awaiting_other_chat"
-
-    carried = json.loads(finish(notices, "peer_sessions", listed))
-    assert carried["peer_update"]["incoming_links"] == ["sender"]
-    assert carried["links"] == []
-    assert finish(notices, "other_tool", {"value": 1}) is None
-    assert [(item["thread_id"], item["link"]) for item in service.sessions({}, "recipient")["links"]] == [
-        ("sender", "incoming"),
-    ]
-    with threads.graph(install) as links:
-        assert links[threads.pair("sender", "recipient")] == ["sender"]
-
-
 def test_peer_arriving_after_discovery_is_not_treated_as_a_returned_address(install, monkeypatch):
     service = import_module("peer-messaging.service")
     clock = [100.0]

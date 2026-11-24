@@ -13,7 +13,7 @@ from persistence_assembly import open_persistence, open_persistence_reader, prof
 from test_local_delivery import call, install  # noqa: F401 -- native temporary profile
 
 
-def pin(home, sid, names=("peer_sessions", "peer_receive", "link_thread")):
+def pin(home, sid, names=("peer_sessions", "peer_receive")):
     with open_persistence(profile_scope(home=home)) as store:
         store.sessions.update_tool_pin(sid, {"tools": [{"function": {"name": name}} for name in names]})
 
@@ -68,14 +68,13 @@ def test_fresh_chat_discovers_root_once_without_peer_text_or_writes(install):
 
 
 def test_twenty_foreign_workers_across_eight_calls_never_update_root_or_child(install, monkeypatch):
-    from test_team_delivery import add_child, link_roots, peers
+    from test_team_delivery import add_child, peers
     service = import_module("peer-messaging.service")
     with open_persistence(profile_scope(home=install)) as store:
         add_child(store, "coordinator-a", "recipient")
         add_child(store, "coordinator-b", "sender")
     for sid in ("recipient", "coordinator-a"):
         pin(install, sid)
-    link_roots()
     clock = [100.0]
     monkeypatch.setattr(service, "time", SimpleNamespace(monotonic=lambda: clock[0], time=service.time.time))
     notices = service.InboxNotices()
@@ -96,7 +95,6 @@ def test_twenty_foreign_workers_across_eight_calls_never_update_root_or_child(in
     assert work(notices, turn="another-turn") is None
     for scope in ("all", "team", "roots"):
         assert set(peers("coordinator-a", scope=scope, same_project=False)) == {"recipient"}
-    assert call("peer_sessions", "coordinator-a")["links"] == []
     assert not call("peer_send", "coordinator-b", target_session_id="coordinator-a",
                     message="Cannot bypass the coordinators")["success"]
     finding = call("peer_send", "coordinator-b", target_session_id="parent", message="Parser change needs coordination")
@@ -117,21 +115,6 @@ def test_twenty_foreign_workers_across_eight_calls_never_update_root_or_child(in
     reported = call("peer_send", "coordinator-a", target_session_id="parent", message="Parser changes are ready")
     assert reported["target_session_id"] == "recipient"
     assert call("peer_receive", "recipient")["messages"][0]["message_id"] == reported["message_id"]
-
-
-def test_incoming_offer_is_addressed_once_even_outside_project(install):
-    service = import_module("peer-messaging.service")
-    pin(install, "elsewhere")
-    notices = service.InboxNotices()
-    assert work(notices, "elsewhere") is None
-    assert call("link_thread", "sender", thread_id="elsewhere")["status"] == "awaiting_other_chat"
-    update = work(notices, "elsewhere")
-    assert update == {"authority": "peer_data", "incoming_links": ["sender"]}
-    assert work(notices, "elsewhere", "another-turn") is None
-    incoming = call("peer_sessions", "elsewhere", scope="team")
-    assert incoming["peers"] == []
-    assert incoming["links"][0]["link"] == "incoming"
-    assert call("link_thread", "elsewhere", thread_id="sender")["status"] == "linked"
 
 
 def test_discovery_rate_limit_and_supported_carrier(install, monkeypatch):
@@ -218,8 +201,21 @@ def test_root_only_scan_is_shared_and_child_awareness_does_not_scan(install, mon
     assert [peer["session_id"] for peer in roots["peers"]] == ["sender"]
     assert "subagent" not in roots["scan_limited_sources"]
     full = service.sessions({"scope": "all"}, "recipient")
-    assert "subagent" in full["scan_limited_sources"]
-    assert counts == {"scans": 4, "owners": 3}
+    assert "subagent" not in full["scan_limited_sources"]
+    assert counts == {"scans": 3, "owners": 3}
+    sibling_directory = service.sessions({"scope": "team"}, "worker-0")
+    assert {p["session_id"] for p in sibling_directory["peers"]} == {
+        "sender", *(f"worker-{index}" for index in range(1, 105)),
+    }
+    assert counts["scans"] == 3
+    with open_persistence(profile_scope(home=install)) as store:
+        add_child(store, "old-sibling", "recipient")
+        add_child(store, "old-worker", "recipient")
+        for index in range(110):
+            add_child(store, f"unrelated-new-{index}", "sender")
+    listed = service.sessions({"scope": "team"}, "old-worker")
+    assert {p["session_id"] for p in listed["peers"]} == {"recipient", "old-sibling"}
+    assert counts["scans"] == 3
 
 
 def test_long_running_owner_not_hidden_by_default_recency_cutoff(install):
@@ -227,12 +223,11 @@ def test_long_running_owner_not_hidden_by_default_recency_cutoff(install):
     from time import time
     service = import_module("peer-messaging.service")
     teams = import_module("peer-messaging.teams")
-    threads = import_module("peer-messaging.threads")
-    with threads.graph(install) as links, open_persistence_reader(install) as store:
+    with open_persistence_reader(install) as store:
         recipient = teams.resolve(store, "recipient")
         future_cutoff = time() + 7200  # All stored last-active timestamps are older.
-        absent, _ = service.discover(store, recipient, links, cutoff=future_cutoff, live_owners=set())
-        leased, _ = service.discover(store, recipient, links, cutoff=future_cutoff,
+        absent, _ = service.discover(store, recipient, cutoff=future_cutoff, live_owners=set())
+        leased, _ = service.discover(store, recipient, cutoff=future_cutoff,
                                     live_owners={"sender"})
     assert not absent
     assert [peer["session_id"] for peer in leased] == ["sender"]
@@ -291,12 +286,11 @@ def test_nested_child_gets_only_immediate_parent_without_ancestor_or_contact_lea
             add_child(store, f"recent-{index}", "sender")
         store.sessions.set_title("sender", "peer-controlled-request")
     pin(install, "reader")
-    assert call("link_thread", "recipient", thread_id="sender")["status"] == "awaiting_other_chat"
     notices = service.InboxNotices()
     assert work(notices, "reader") == {"authority": "peer_data", "parent": "parent-child"}
     assert work(notices, "reader", "next-turn") is None
     listed = call("peer_sessions", "reader", scope="all", same_project=False)
-    assert listed["success"] and listed["links"] == []
+    assert listed["success"] and "links" not in listed
     assert listed["parent_thread_id"] == "parent-child"
     parent_peer, = listed["peers"]
     assert parent_peer["session_id"] == ("parent-tip" if compressed else "parent-child")

@@ -1,4 +1,4 @@
-"""Short-lived profile candidate snapshots; never cache routing permission."""
+"""Root discovery cache and native immediate-family candidate queries."""
 from __future__ import annotations
 
 import threading
@@ -15,42 +15,51 @@ class CandidateSnapshot:
     live_owners: frozenset[str] | None
 
 
-def scan(store, live_owners=None, *, roots_only=False):
+def scan(store, live_owners=None):
     from . import service
 
-    candidates, limited = [], []
-    groups = [("local", tuple(sorted(service.STORED)))]
-    if not roots_only:
-        groups.append(("subagent", ("subagent",)))
-    for label, sources in groups:
-        rows = store.sessions.list_sessions(
-            SessionQuery(sources=sources, local_created_sources=tuple(sorted(service.LOCAL)) if label == "local" else None,
-                         include_children=True, include_subagents=not roots_only,
-                         order=SessionOrder.LAST_ACTIVE, project_compression_tips=False),
-            SessionWindow(limit=service.SCAN_LIMIT), compact_rows=True,
-        )
-        if len(rows) >= service.SCAN_LIMIT:
-            limited.append(label)
-        candidates.extend((entry.session.session_id, entry.last_active) for entry in rows)
-    return CandidateSnapshot(tuple(candidates), tuple(limited),
+    rows = store.sessions.list_sessions(
+        SessionQuery(sources=tuple(sorted(service.STORED)), local_created_sources=tuple(sorted(service.LOCAL)),
+                     include_children=True, include_subagents=False,
+                     order=SessionOrder.LAST_ACTIVE, project_compression_tips=False),
+        SessionWindow(limit=service.SCAN_LIMIT), compact_rows=True,
+    )
+    return CandidateSnapshot(tuple((entry.session.session_id, entry.last_active) for entry in rows),
+                             ("local",) if len(rows) >= service.SCAN_LIMIT else (),
                              None if live_owners is None else frozenset(live_owners))
 
 
-class CandidateCache:
-    """Bounded per-process cache shared by local agents in the same profile.
+def family_candidates(store, own):
+    """Find children and siblings by native delegation markers, not a global list.
 
-    Only discovery candidates and informational owner presence can be stale.
-    Callers still resolve every identity and check the current link graph and
-    project mapping. No store handles or session records outlive their reader.
+    The marker lookup is only a candidate index. The caller still resolves
+    every returned identity and verifies its delegation/compression edge.
     """
+    from . import teams
+
+    parents = [own]
+    if own.is_child:
+        try:
+            parents.append(teams.resolve(store, own.parent_session_id, allow_ended=True))
+        except ValueError:
+            pass
+    candidates = set()
+    for parent in parents:
+        for segment in teams.compression_ids(store, parent):
+            candidates.update(store.sessions.subagent_session_ids(segment, "_delegate_from"))
+    return tuple(sorted(candidates))
+
+
+class CandidateCache:
+    """Short-lived independent-root candidates, never access permissions."""
 
     def __init__(self):
         self.lock = threading.Lock()
         self.snapshots = OrderedDict()
         self.generation = 0
 
-    def get(self, home, store, *, now, max_age, owner_loader, refresh=False, roots_only=False):
-        key = (str(home), roots_only)
+    def get(self, home, store, *, now, max_age, owner_loader, refresh=False):
+        key = str(home)
         with self.lock:
             previous = self.snapshots.get(key)
             if not refresh and previous is not None and 0 <= now - previous[0] < max_age:
@@ -58,9 +67,7 @@ class CandidateCache:
                 return previous[1]
             self.generation += 1
             generation = self.generation
-        # Do not serialize another agent behind storage or owner I/O. A first
-        # concurrent miss may scan twice; completed snapshots are then shared.
-        snapshot = scan(store, owner_loader(home), roots_only=roots_only)
+        snapshot = scan(store, owner_loader(home))
         with self.lock:
             previous = self.snapshots.get(key)
             if previous is not None and previous[2] > generation:

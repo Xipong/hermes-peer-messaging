@@ -31,8 +31,8 @@ def test_nested_children_keep_team_identity_when_parent_compresses(install):
         assert worker.parent_session_id == "a1"
         assert worker.parent_thread_id == "a1"
         assert worker.thread_id == "nested"
-        assert not teams.allowed(worker, root, {})
-        assert teams.allowed(worker, teams.resolve(store, "a1"), {})
+        assert not teams.allowed(worker, root)
+        assert teams.allowed(worker, teams.resolve(store, "a1"))
         assert teams.describe(worker) == {
             "session_id": "nested", "thread_id": "nested", "root_thread_id": "sender",
             "parent_session_id": "a1", "parent_thread_id": "a1", "subagent_id": "task-nested", "is_child": True,
@@ -77,38 +77,12 @@ def test_forked_child_cannot_inherit_a_team_or_its_inbox(install, kind):
                 teams.resolve(store, sid)
 
 
-def test_root_links_never_grant_access_to_other_teams_children(install):
-    with open_persistence(profile_scope(home=install)) as store:
-        store.sessions.create(NewSession("third", "cli", cwd="/project/third", git_repo_root="/project"))
-        store.sessions.create(NewSession("branch", "cli", parent_session_id="sender",
-                                         lineage_kind=SessionLineageKind.BRANCH))
-        for sid, parent in (("a1", "sender"), ("a2", "sender"), ("b1", "recipient"),
-                            ("c1", "third"), ("branch-child", "branch")):
-            child(store, sid, parent)
-    with open_persistence_reader(install) as store:
-        a, sibling, b, c, branch = (teams.resolve(store, sid) for sid in ("a1", "a2", "b1", "c1", "branch-child"))
-        links = {"recipient:sender": ["sender"]}
-        assert teams.allowed(a, sibling, links)
-        assert not teams.allowed(a, b, links)
-        links["recipient:sender"] = ["sender", "recipient"]
-        links["recipient:third"] = ["recipient", "third"]
-        assert not teams.allowed(a, b, links) and not teams.allowed(b, c, links)
-        assert not teams.allowed(a, c, links)
-        assert branch.root_id == "branch" and not teams.allowed(branch, a, links)
-        links.pop("recipient:sender")
-        assert not teams.allowed(a, b, links)
-        parent_a, parent_b = teams.resolve(store, "sender"), teams.resolve(store, "recipient")
-        assert teams.allowed(parent_a, parent_b, links)
-
-
 def test_hierarchy_discovery_and_known_address_sends_share_the_same_boundary(install):
     edges = (("a2", "sender"), ("b2", "sender"), ("a3", "a2"), ("a4", "a2"),
              ("b3", "b2"), ("b4", "b2"), ("other-child", "recipient"))
     with open_persistence(profile_scope(home=install)) as store:
         for sid, parent in edges:
             child(store, sid, parent)
-    assert call("link_thread", "sender", thread_id="recipient")["success"]
-    assert call("link_thread", "recipient", thread_id="sender")["status"] == "linked"
     allowed_edges = {frozenset(edge) for edge in (
         *edges, ("a2", "b2"), ("a3", "a4"), ("b3", "b4"), ("sender", "recipient"),
     )}
@@ -117,8 +91,7 @@ def test_hierarchy_discovery_and_known_address_sends_share_the_same_boundary(ins
         resolved = {sid: teams.resolve(store, sid) for sid in participants}
         for sender in participants:
             for target in participants:
-                assert teams.allowed(resolved[sender], resolved[target],
-                                     {"recipient:sender": ["recipient", "sender"]}) == (
+                assert teams.allowed(resolved[sender], resolved[target]) == (
                     frozenset((sender, target)) in allowed_edges)
     for sender in participants:
         listed = call("peer_sessions", sender, scope="all", same_project=False)

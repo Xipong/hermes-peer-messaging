@@ -41,33 +41,20 @@ def teams(install):
     return install
 
 
-def link_roots():
-    assert ok("link_thread", "sender", thread_id="recipient")["status"] == "awaiting_other_chat"
-    assert ok("link_thread", "recipient", thread_id="sender")["status"] == "linked"
-
-
 def peers(sid, **kwargs):
     return {peer["session_id"]: peer for peer in ok("peer_sessions", sid, **kwargs)["peers"]}
 
 
-def test_root_links_keep_workers_private_and_coordination_goes_through_parents(teams):
+def test_roots_keep_workers_private_and_coordination_goes_through_parents(teams):
     assert set(peers("sender")) == {"recipient", "a1", "a2"}
     assert set(peers("a1")) == {"sender", "a2"}
     assert not call("peer_send", "a1", target_session_id="b1", message="too early")["success"]
     assert not call("peer_send", "sender", target_session_id="b1", message="too early")["success"]
-    assert not call("link_thread", "a1", thread_id="recipient")["success"]
-    assert not call("link_thread", "sender", thread_id="b1")["success"]
-
-    ok("link_thread", "sender", thread_id="recipient")
-    assert "b1" not in peers("a1")
-    assert not call("peer_send", "a1", target_session_id="b1", message="one offer only")["success"]
-    ok("link_thread", "recipient", thread_id="sender")
     discovered = peers("a1")
     assert set(discovered) == {"sender", "a2"}
     assert discovered["a2"]["parent_thread_id"] == "sender"
     assert discovered["a2"]["subagent_id"] == "task-a2"
     assert discovered["a2"]["is_child"] is True
-    assert ok("peer_sessions", "a1")["links"] == []
     assert set(peers("sender")) == {"recipient", "a1", "a2"}
     for sender, target in (("a1", "b1"), ("a1", "recipient"), ("sender", "b1")):
         assert not call("peer_send", sender, target_session_id=target, message="Still outside my family")["success"]
@@ -130,7 +117,6 @@ def test_nested_family_boundaries_and_separate_inboxes(teams):
     assert ok("peer_receive", "sender")["messages"] == []
     assert ok("peer_receive", "a1", action="ack", message_ids=[parent_note["message_id"]])["acknowledged"] == []
     assert ok("peer_receive", "a-deep")["messages"][0]["message_id"] == parent_note["message_id"]
-    link_roots()
     assert set(peers("a-deep", same_project=False)) == {"a1", "a-deep-sibling"}
     assert not call("peer_send", "a-deep", target_session_id="b2", message="Links do not widen family")["success"]
 
@@ -165,8 +151,7 @@ def test_parent_alias_targets_immediate_parent_through_compaction(teams):
     assert refused["success"] is False and "no delegation parent" in refused["error"]
 
 
-def test_cross_project_contacts_never_grant_worker_access(install):
-    from test_awareness import pin, tool
+def test_cross_project_roots_never_grant_worker_access(install):
     from test_hermes_projects import project
 
     with open_persistence(profile_scope(home=install)) as store:
@@ -174,19 +159,8 @@ def test_cross_project_contacts_never_grant_worker_access(install):
         add_child(store, "other-child", "elsewhere", cwd="/other/work", git_root="/other")
     args = {"target_session_id": "other-child", "message": "Cross-project coordination"}
     assert not call("peer_send", "api-child", **args)["success"]
-    pin(install, "elsewhere")
-    assert ok("link_thread", "sender", thread_id="elsewhere")["status"] == "awaiting_other_chat"
-    assert tool("elsewhere", "incoming")["peer_update"]["incoming_links"] == ["sender"]
-    offer, = ok("peer_sessions", "elsewhere")["links"]
-    assert offer["thread_id"] == "sender" and offer["link"] == "incoming"
-    assert "other-child" not in peers("api-child", same_project=False)
-    assert not call("peer_send", "api-child", **args)["success"]
-
-    accepted = ok("link_thread", "elsewhere", thread_id="sender")
-    assert accepted["status"] == "linked"
     for same_project in (True, False):
         assert set(peers("api-child", same_project=same_project)) == {"sender"}
-    assert ok("peer_sessions", "api-child", same_project=False)["links"] == []
     assert not call("peer_send", "api-child", **args)["success"]
     sent = ok("peer_send", "sender", target_session_id="elsewhere", message="Cross-project root coordination")
     assert ok("peer_receive", "elsewhere")["messages"][0]["message_id"] == sent["message_id"]
@@ -198,8 +172,6 @@ def test_cross_project_contacts_never_grant_worker_access(install):
     assert set(peers("api-child")) == {"sender"}
     assert "elsewhere" in peers("sender")
     assert not call("peer_send", "api-child", **args)["success"]
-    assert ok("peer_sessions", "sender")["links"][0]["link"] == "linked"
-    ok("link_thread", "sender", thread_id="elsewhere", action="unlink")
     assert not call("peer_send", "api-child", **args)["success"]
     assert ok("peer_send", "sender", target_session_id="elsewhere", message="Roots remain reachable")["status"] == "queued"
 
@@ -229,7 +201,6 @@ def test_pathless_team_discovers_other_batches_and_parent_without_project(instal
 
 
 def test_family_policy_preserves_already_published_legacy_v2_mail(teams):
-    link_roots()
     mailbox = import_module("peer-messaging.mailbox")
     # Model a valid v2 envelope published by an older plugin, before the new
     # family boundary. Historical mail remains recipient-owned until explicit ACK.
@@ -237,21 +208,21 @@ def test_family_policy_preserves_already_published_legacy_v2_mail(teams):
                                sender="a1", target="b1", text="Published before the family policy")
     assert not call("peer_send", "a1", target_session_id="b1", message="Cannot publish new cross-family mail")["success"]
     assert ok("peer_receive", "b1")["messages"][0]["message_id"] == accepted["message_id"]
-    ok("link_thread", "recipient", thread_id="sender", action="unlink")
     assert set(peers("a1")) == {"sender", "a2"}
-    assert not call("peer_send", "a1", target_session_id="b1", message="after unlink")["success"]
-    assert not call("peer_send", "b1", target_session_id="sender", message="after unlink")["success"]
+    assert not call("peer_send", "a1", target_session_id="b1", message="still outside family")["success"]
+    assert not call("peer_send", "b1", target_session_id="sender", message="still outside family")["success"]
     assert ok("peer_receive", "b1")["messages"][0]["message_id"] == accepted["message_id"]
     assert ok("peer_receive", "b1", action="ack", message_ids=[accepted["message_id"]])["acknowledged"] == [accepted["message_id"]]
     assert ok("peer_send", "a1", target_session_id="a2", message="Own team still reachable")["status"] == "queued"
 
 
-def test_contact_graph_cannot_authorize_or_block_family_delivery(teams):
+def test_legacy_contact_graph_is_ignored_and_untouched(teams):
     from hermes_cli.active_sessions import _FileLock
 
-    link_roots()
     folder = teams / "runtime" / "peer_messages_v2"
+    folder.mkdir(parents=True, exist_ok=True)
     graph = folder / ".threads.json"
+    graph.write_text('{"version":2,"links":{"recipient:sender":["recipient","sender"]}}')
     before, modified = graph.read_bytes(), graph.stat().st_mtime_ns
     entries = set(folder.iterdir())
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -289,8 +260,7 @@ def test_gateway_foreign_or_unattributed_children_cannot_route_as_local_teams(te
     assert ok("peer_receive", "sender")["messages"] == []
 
 
-def test_branched_root_and_its_children_do_not_inherit_team_links(teams):
-    link_roots()
+def test_branched_root_and_its_children_remain_separate(teams):
     with open_persistence(profile_scope(home=teams)) as store:
         store.sessions.create(NewSession(
             "branched-root", "desktop", parent_session_id="sender", lineage_kind=SessionLineageKind.BRANCH,
@@ -299,8 +269,6 @@ def test_branched_root_and_its_children_do_not_inherit_team_links(teams):
         add_child(store, "branched-child", "branched-root")
     assert set(peers("branched-child")) == {"branched-root"}
     assert peers("branched-child")["branched-root"]["thread_id"] == "branched-root"
-    assert ok("peer_sessions", "branched-child")["links"] == []
-    assert ok("peer_sessions", "branched-root")["links"] == []
     assert not call("peer_send", "branched-child", target_session_id="b1", message="no inherited link")["success"]
     assert not call("peer_send", "a1", target_session_id="branched-child", message="separate root")["success"]
 

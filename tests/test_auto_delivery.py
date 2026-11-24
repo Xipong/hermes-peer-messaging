@@ -357,7 +357,6 @@ def test_real_executor_and_host_request_hooks_require_durable_delivery(install, 
 
     body = "Delivered on ordinary work, without polling the inbox"
     key = queue(body)
-    assert call("link_thread", "sender", thread_id="recipient")["status"] == "awaiting_other_chat"
     definitions = get_tool_definitions(enabled_toolsets=["peer_messaging"], quiet_mode=True,
                                        skip_tool_search_assembly=True)
     with open_persistence(profile_scope(home=install)) as store:
@@ -406,7 +405,6 @@ def test_real_executor_and_host_request_hooks_require_durable_delivery(install, 
             if fallback:
                 assert payload["success"] and not {"messages", "has_more", "note"} & payload.keys()
             assert payload["peer_update"]["neighbors"] == ["sender"]
-            assert payload["peer_update"]["incoming_links"] == ["sender"]
             assert not payload["peer_update"].get("mail_pending")
             assert pending(install)["pending_count"] == 1
             outbound = [{name: value for name, value in row.items()
