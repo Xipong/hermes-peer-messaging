@@ -95,16 +95,16 @@ def test_twenty_foreign_workers_across_eight_calls_never_update_root_or_child(in
     assert work(notices, turn="another-turn") is None
     for scope in ("all", "team", "roots"):
         assert set(peers("coordinator-a", scope=scope, same_project=False)) == {"recipient"}
-    assert not call("peer_send", "coordinator-b", target_session_id="coordinator-a",
+    assert not call("peer_send", "coordinator-b", target_session_ids=["coordinator-a"],
                     message="Cannot bypass the coordinators")["success"]
-    finding = call("peer_send", "coordinator-b", target_session_id="parent", message="Parser change needs coordination")
+    finding = call("peer_send", "coordinator-b", target_session_ids=["parent"], message="Parser change needs coordination")["results"][0]
     assert call("peer_receive", "sender")["messages"][0]["message_id"] == finding["message_id"]
-    forwarded = call("peer_send", "sender", target_session_id="recipient", message="Coordinate parser changes",
-                     in_reply_to=finding["message_id"])
+    forwarded = call("peer_send", "sender", target_session_ids=["recipient"], message="Coordinate parser changes",
+                     in_reply_to=finding["message_id"])["results"][0]
     assert call("peer_receive", "recipient")["messages"][0]["message_id"] == forwarded["message_id"]
     assert call("peer_receive", "recipient", action="ack", message_ids=[forwarded["message_id"]])["acknowledged"] == [forwarded["message_id"]]
-    sent = call("peer_send", "recipient", target_session_id="coordinator-a", message="Coordinate parser changes",
-                in_reply_to=forwarded["message_id"])
+    sent = call("peer_send", "recipient", target_session_ids=["coordinator-a"], message="Coordinate parser changes",
+                in_reply_to=forwarded["message_id"])["results"][0]
     assert sent["status"] == "queued"
     delivery = import_module("peer-messaging.delivery").InboxDelivery()
     receiver = service.InboxNotices(delivery)
@@ -112,7 +112,7 @@ def test_twenty_foreign_workers_across_eight_calls_never_update_root_or_child(in
                                               turn_id="mail-turn", tool_call_id="receive-coordination"))
     assert carried["peer_data"]["messages"][0]["message_id"] == sent["message_id"]
     assert "neighbors" not in carried.get("peer_update", {})
-    reported = call("peer_send", "coordinator-a", target_session_id="parent", message="Parser changes are ready")
+    reported = call("peer_send", "coordinator-a", target_session_ids=["parent"], message="Parser changes are ready")["results"][0]
     assert reported["target_session_id"] == "recipient"
     assert call("peer_receive", "recipient")["messages"][0]["message_id"] == reported["message_id"]
 
@@ -163,7 +163,7 @@ def test_compaction_of_either_root_does_not_repeat_neighbor_notice(install, monk
     clock[0] += service.DISCOVERY_INTERVAL + 1
     assert work(notices, "recipient-tip", "new-turn") is None
     assert call("peer_sessions", "recipient-tip", scope="roots")["peers"][0]["thread_id"] == "sender"
-    assert call("peer_send", "recipient-tip", target_session_id="sender", message="Stable address")["target_session_id"] == "sender-tip"
+    assert call("peer_send", "recipient-tip", target_session_ids=["sender"], message="Stable address")["results"][0]["target_session_id"] == "sender-tip"
 
 
 def test_root_only_scan_is_shared_and_child_awareness_does_not_scan(install, monkeypatch):
@@ -302,7 +302,7 @@ def test_nested_child_gets_only_immediate_parent_without_ancestor_or_contact_lea
     for hidden in ("sender", "recipient", "peer-controlled-request", *(f"recent-{index}" for index in range(12))):
         assert json.dumps(hidden) not in encoded
     assert "root_thread_id" not in parent_peer and "root_thread_id" not in listed
-    sent = call("peer_send", "reader", target_session_id="parent-child", message="Addressed without directory lookup")
+    sent = call("peer_send", "reader", target_session_ids=["parent-child"], message="Addressed without directory lookup")["results"][0]
     assert sent["target_session_id"] == ("parent-tip" if compressed else "parent-child")
-    assert sent["from_thread_id"] == "reader" and sent["target_thread_id"] == "parent-child"
+    assert sent["target_thread_id"] == "parent-child"
     assert json.dumps("sender") not in json.dumps(sent)

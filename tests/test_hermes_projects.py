@@ -32,17 +32,17 @@ def test_explicit_project_spans_separate_repositories_and_delegated_teams(instal
     assert peers["hermes_project_id"] == project_id
     assert {p["session_id"] for p in peers["peers"]} == {"frontend", "a-child"}
     assert next(p for p in peers["peers"] if p["session_id"] == "frontend")["hermes_project_id"] == project_id
-    assert not call("peer_send", "a-child", target_session_id="b-child", message="outside family")["success"]
+    assert not call("peer_send", "a-child", target_session_ids=["b-child"], message="outside family")["success"]
     for same_project in (True, False):
         child = call("peer_sessions", "a-child", same_project=same_project)
         assert child["hermes_project_id"] == project_id
         assert {p["session_id"] for p in child["peers"]} == {"sender"}
-    assert not call("peer_send", "a-child", target_session_id="b-child", message="Project does not widen family")["success"]
-    sent = call("peer_send", "sender", target_session_id="frontend", message="We own the API changes")
+    assert not call("peer_send", "a-child", target_session_ids=["b-child"], message="Project does not widen family")["success"]
+    sent = call("peer_send", "sender", target_session_ids=["frontend"], message="We own the API changes")["results"][0]
     assert sent["status"] == "queued"
     assert call("peer_receive", "frontend")["messages"][0]["message_id"] == sent["message_id"]
-    forwarded = call("peer_send", "frontend", target_session_id="b-child", message="Handle the frontend changes",
-                     in_reply_to=sent["message_id"])
+    forwarded = call("peer_send", "frontend", target_session_ids=["b-child"], message="Handle the frontend changes",
+                     in_reply_to=sent["message_id"])["results"][0]
     assert call("peer_receive", "b-child")["messages"][0]["message_id"] == forwarded["message_id"]
 
 
@@ -52,7 +52,7 @@ def test_nested_named_project_takes_precedence_over_shared_git_root(install):
     assert call("peer_sessions", "sender")["hermes_project_id"] == inner
     assert "recipient" not in {p["session_id"] for p in call("peer_sessions", "sender")["peers"]}
     # Independent roots can coordinate without widening family access.
-    assert call("peer_send", "sender", target_session_id="recipient", message="heads up")["status"] == "queued"
+    assert call("peer_send", "sender", target_session_ids=["recipient"], message="heads up")["status"] == "queued"
 
 
 def test_active_project_pointer_and_pathless_project_do_not_claim_unrelated_chat(install):

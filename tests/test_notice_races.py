@@ -27,12 +27,12 @@ def finish(notices, tool_name, result, args=None):
 def test_mail_arriving_after_read_is_not_marked_as_already_inspected(install):
     service = import_module("peer-messaging.service")
     notices = tracker(install, "peer_receive")
-    first = call("peer_send", "sender", target_session_id="recipient", message="first note")
+    first = call("peer_send", "sender", target_session_ids=["recipient"], message="first note")["results"][0]
     read = service.receive({}, "recipient")
     assert [item["message_id"] for item in read["messages"]] == [first["message_id"]]
 
     # This models the dispatcher finishing the read before its transform hook runs.
-    late = call("peer_send", "sender", target_session_id="recipient", message="late private note")
+    late = call("peer_send", "sender", target_session_ids=["recipient"], message="late private note")["results"][0]
     carried = json.loads(finish(notices, "peer_receive", read))
     assert carried["peer_update"]["mail_pending"] is True
     assert carried["messages"] == read["messages"]
@@ -46,14 +46,14 @@ def test_mail_arriving_after_read_is_not_marked_as_already_inspected(install):
 def test_mail_arriving_after_ack_still_announces_itself_in_the_same_turn(install):
     service = import_module("peer-messaging.service")
     notices = tracker(install, "peer_receive")
-    first = call("peer_send", "sender", target_session_id="recipient", message="first note")
+    first = call("peer_send", "sender", target_session_ids=["recipient"], message="first note")["results"][0]
     read = service.receive({}, "recipient")
     assert finish(notices, "peer_receive", read) is None
     args = {"action": "ack", "message_ids": [first["message_id"]]}
     acknowledged = service.receive(args, "recipient")
     assert acknowledged["acknowledged"] == [first["message_id"]]
 
-    late = call("peer_send", "sender", target_session_id="recipient", message="arrived after ACK")
+    late = call("peer_send", "sender", target_session_ids=["recipient"], message="arrived after ACK")["results"][0]
     carried = json.loads(finish(notices, "peer_receive", acknowledged, args))
     assert carried["peer_update"]["mail_pending"] is True
     assert carried["acknowledged"] == [first["message_id"]]

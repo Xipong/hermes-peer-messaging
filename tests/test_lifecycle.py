@@ -28,7 +28,7 @@ def test_recipient_state_is_advisory_and_rejects_reused_short_id(install):
     with open_persistence(profile_scope(home=install)) as store:
         add_child(store, "child", "sender")
         stamp(store, "child", SubagentState.RUNNING, document_sid="elsewhere")
-    sent = call("peer_send", "sender", target_session_id="recipient", message="note")
+    sent = call("peer_send", "sender", target_session_ids=["recipient"], message="note")["results"][0]
     assert sent["status"] == "queued"
     assert set(sent["recipient_state"]) == {"owner_present", "subagent_state", "last_activity_at"}
     with open_persistence_reader(install) as store:
@@ -73,7 +73,7 @@ def test_closed_mail_is_archived_not_lost_and_reopened_mail_is_fifo(install, mon
         assert (folder / sid / name).is_file() != archived
     with open_persistence(profile_scope(home=install)) as store:
         store.sessions.reopen("finished")
-    second = call("peer_send", "sender", target_session_id="finished", message="new mail")
+    second = call("peer_send", "sender", target_session_ids=["finished"], message="new mail")["results"][0]
     assert second["status"] == "queued"
     received = call("peer_receive", "finished")
     assert [m["message_id"] for m in received["messages"]] == [

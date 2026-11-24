@@ -22,7 +22,7 @@ def pending(home):
 
 
 def queue(message="A peer finding; continue the existing task"):
-    sent = call("peer_send", "sender", target_session_id="recipient", message=message)
+    sent = call("peer_send", "sender", target_session_ids=["recipient"], message=message)["results"][0]
     assert sent.get("success"), sent
     return sent["message_id"]
 
@@ -381,7 +381,7 @@ def test_real_executor_and_host_request_hooks_require_durable_delivery(
         coordination = "The QA window is free; use the approved build."
         if send_with_work:
             calls.append(SimpleNamespace(id="send-call", type="function", function=SimpleNamespace(
-                name="peer_send", arguments=json.dumps({"target_session_id": "sender", "message": coordination}))))
+                name="peer_send", arguments=json.dumps({"target_session_ids": ["sender", "elsewhere"], "message": coordination}))))
         rows = [{"role": "user", "content": "Continue my existing authorized task"},
                 {"role": "assistant", "content": None, "tool_calls": [
                     {"id": call.id, "type": call.type, "function": vars(call.function)} for call in calls
@@ -406,9 +406,12 @@ def test_real_executor_and_host_request_hooks_require_durable_delivery(
                 assert rows[-1]["tool_call_id"] == "send-call"
                 sent = json.loads(rows[-1]["content"])
                 assert sent["status"] == "queued" and "peer_data" not in sent
+                assert sent["queued_count"] == 2
                 mailbox = import_module("peer-messaging.mailbox")
-                letters = mailbox.read_pending(inbox(install).with_name("sender"))["messages"]
-                assert [(m["message_id"], m["message"]) for m in letters] == [(sent["message_id"], coordination)]
+                assert {item["target_session_id"] for item in sent["results"]} == {"sender", "elsewhere"}
+                for item in sent["results"]:
+                    letters = mailbox.read_pending(inbox(install).with_name(item["target_session_id"]))["messages"]
+                    assert [(m["message_id"], m["message"]) for m in letters] == [(item["message_id"], coordination)]
             if fallback:
                 assert tool["content"].startswith("{")
             else:
