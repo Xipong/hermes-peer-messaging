@@ -1,4 +1,4 @@
-"""Direct, mutually accepted links between independent local roots."""
+"""Stable coordinator contacts between independent local roots, without access grants."""
 from __future__ import annotations
 
 import json
@@ -111,7 +111,9 @@ def link(args, sid):
 
 
 def directory(store, own, links, *, incoming_only=False):
-    """Link management is independent of project/recency and peer search scope."""
+    """Root contacts ignore project/recency filters but stay private to roots."""
+    if own.is_child:
+        return []
     result = []
     for other_id, offers in neighbors(links, own.root_id):
         state = "linked" if accepted(offers, own.root_id, other_id) else (

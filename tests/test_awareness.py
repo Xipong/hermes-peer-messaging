@@ -80,7 +80,7 @@ def test_twenty_foreign_workers_across_eight_calls_never_update_root_or_child(in
     monkeypatch.setattr(service, "time", SimpleNamespace(monotonic=lambda: clock[0], time=service.time.time))
     notices = service.InboxNotices()
     assert work(notices)["neighbors"] == ["sender"]
-    assert work(notices, "coordinator-a") == {"authority": "peer_data", "parent": "recipient", "root": "recipient"}
+    assert work(notices, "coordinator-a") == {"authority": "peer_data", "parent": "recipient"}
     index = 0
     for batch in range(8):
         with open_persistence(profile_scope(home=install)) as store:
@@ -94,10 +94,19 @@ def test_twenty_foreign_workers_across_eight_calls_never_update_root_or_child(in
         assert work(notices, "coordinator-a") is None
     assert index == 20
     assert work(notices, turn="another-turn") is None
-    assert "foreign-19" in peers("coordinator-a", scope="all")
-    assert set(peers("coordinator-a", scope="team")) == {"recipient"}
-    assert set(peers("coordinator-a", scope="roots")) == {"recipient", "sender"}
-    sent = call("peer_send", "coordinator-b", target_session_id="coordinator-a", message="Coordinate parser changes")
+    for scope in ("all", "team", "roots"):
+        assert set(peers("coordinator-a", scope=scope, same_project=False)) == {"recipient"}
+    assert call("peer_sessions", "coordinator-a")["links"] == []
+    assert not call("peer_send", "coordinator-b", target_session_id="coordinator-a",
+                    message="Cannot bypass the coordinators")["success"]
+    finding = call("peer_send", "coordinator-b", target_session_id="parent", message="Parser change needs coordination")
+    assert call("peer_receive", "sender")["messages"][0]["message_id"] == finding["message_id"]
+    forwarded = call("peer_send", "sender", target_session_id="recipient", message="Coordinate parser changes",
+                     in_reply_to=finding["message_id"])
+    assert call("peer_receive", "recipient")["messages"][0]["message_id"] == forwarded["message_id"]
+    assert call("peer_receive", "recipient", action="ack", message_ids=[forwarded["message_id"]])["acknowledged"] == [forwarded["message_id"]]
+    sent = call("peer_send", "recipient", target_session_id="coordinator-a", message="Coordinate parser changes",
+                in_reply_to=forwarded["message_id"])
     assert sent["status"] == "queued"
     delivery = import_module("peer-messaging.delivery").InboxDelivery()
     receiver = service.InboxNotices(delivery)
@@ -105,7 +114,7 @@ def test_twenty_foreign_workers_across_eight_calls_never_update_root_or_child(in
                                               turn_id="mail-turn", tool_call_id="receive-coordination"))
     assert carried["peer_data"]["messages"][0]["message_id"] == sent["message_id"]
     assert "neighbors" not in carried.get("peer_update", {})
-    reported = call("peer_send", "coordinator-a", target_session_id="parent", message="Agreed with other coordinator")
+    reported = call("peer_send", "coordinator-a", target_session_id="parent", message="Parser changes are ready")
     assert reported["target_session_id"] == "recipient"
     assert call("peer_receive", "recipient")["messages"][0]["message_id"] == reported["message_id"]
 
@@ -262,7 +271,7 @@ def test_awareness_observes_old_live_owners_without_waiting_for_registry_writer(
 
 
 @pytest.mark.parametrize("compressed", [False, True])
-def test_nested_child_gets_only_parent_and_root_addresses(install, compressed):
+def test_nested_child_gets_only_immediate_parent_without_ancestor_or_contact_leaks(install, compressed):
     service = import_module("peer-messaging.service")
     from test_team_delivery import add_child
     with open_persistence(profile_scope(home=install)) as store:
@@ -281,9 +290,25 @@ def test_nested_child_gets_only_parent_and_root_addresses(install, compressed):
         for index in range(12):
             add_child(store, f"recent-{index}", "sender")
         store.sessions.set_title("sender", "peer-controlled-request")
-    pin(install, "reader", ("peer_sessions",))
+    pin(install, "reader")
+    assert call("link_thread", "recipient", thread_id="sender")["status"] == "awaiting_other_chat"
     notices = service.InboxNotices()
-    assert work(notices, "reader") == {"authority": "peer_data", "parent": "parent-child", "root": "sender"}
+    assert work(notices, "reader") == {"authority": "peer_data", "parent": "parent-child"}
     assert work(notices, "reader", "next-turn") is None
+    listed = call("peer_sessions", "reader", scope="all", same_project=False)
+    assert listed["success"] and listed["links"] == []
+    assert listed["parent_thread_id"] == "parent-child"
+    parent_peer, = listed["peers"]
+    assert parent_peer["session_id"] == ("parent-tip" if compressed else "parent-child")
+    assert parent_peer["relation"] == "parent"
+    assert parent_peer["parent_session_id"] is None and parent_peer["parent_thread_id"] is None
+    # Visible parent metadata must not become a back door to its own parent,
+    # its siblings, or the independent root that offered a contact link.
+    encoded = json.dumps(listed)
+    for hidden in ("sender", "recipient", "peer-controlled-request", *(f"recent-{index}" for index in range(12))):
+        assert json.dumps(hidden) not in encoded
+    assert "root_thread_id" not in parent_peer and "root_thread_id" not in listed
     sent = call("peer_send", "reader", target_session_id="parent-child", message="Addressed without directory lookup")
     assert sent["target_session_id"] == ("parent-tip" if compressed else "parent-child")
+    assert sent["from_thread_id"] == "reader" and sent["target_thread_id"] == "parent-child"
+    assert json.dumps("sender") not in json.dumps(sent)

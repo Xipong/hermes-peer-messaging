@@ -1,7 +1,7 @@
-"""Durable local-team identities, derived from verified stored parent edges.
+"""Durable participant identities and immediate-family communication boundaries.
 
 Subagent markers locate candidates; they never establish ownership on their own.
-Only a direct link between the two local roots grants communication across teams.
+Coordinators carry information between branches; a root link never admits workers.
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ class Participant:
     root_id: str
     root: SessionRecord
     parent_session_id: str | None
+    parent_thread_id: str | None
     subagent_id: str | None
 
     @property
@@ -90,7 +91,7 @@ class _Resolver:
         if not follow and current.session_id != row.session_id:
             raise ValueError("This chat rotated; use its current session")
         current = self.get(current.session_id)
-        return Participant(current, root_id, root_id, current, None, None)
+        return Participant(current, root_id, root_id, current, None, None, None)
 
     def team_root(self, row):
         seen = set()
@@ -135,8 +136,12 @@ class _Resolver:
             raise ValueError("This chat rotated; use its current session")
         self.live(current)
         root = self.team_root(first)
+        parent = self.get(first.parent_session_id)
+        # The stored delegation edge can point to any verified compression
+        # segment. Siblings born before and after that rotation share a parent.
+        parent_id = self.segments(parent)[-1].session_id if _child(parent) else root.thread_id
         return Participant(current, first.session_id, root.root_id, root.root,
-                           first.parent_session_id, _subagent_id(current) or subagent_id)
+                           first.parent_session_id, parent_id, _subagent_id(current) or subagent_id)
 
 
 def resolve(store, sid, *, follow=True, allow_ended=False) -> Participant:
@@ -145,22 +150,50 @@ def resolve(store, sid, *, follow=True, allow_ended=False) -> Participant:
     return resolver.child(row, follow=follow) if _child(row) else resolver.local(row, follow=follow)
 
 
-def allowed(a, b, links) -> bool:
-    from . import service, threads
-
-    if not service.same_profile(a.root.profile_name, b.root.profile_name):
-        return False
-    if a.root_id == b.root_id:
-        return True
-    if not (a.is_child or b.is_child):
-        return True
-    return threads.accepted(links.get(threads.pair(a.root_id, b.root_id)), a.root_id, b.root_id)
-
-
-def describe(participant) -> dict:
+def relationship(a, b) -> str | None:
+    """Describe b from a's permitted neighborhood, using stable parent edges."""
     from . import service
 
-    return {"session_id": participant.row.session_id, "thread_id": participant.thread_id,
-            "root_thread_id": participant.root_id, "parent_session_id": participant.parent_session_id,
-            "subagent_id": participant.subagent_id, "is_child": participant.is_child,
-            "title": participant.row.title, "source": service.surface(participant.row)}
+    if not service.same_profile(a.root.profile_name, b.root.profile_name):
+        return None
+    if a.thread_id == b.thread_id:
+        return "self"
+    if not (a.is_child or b.is_child):
+        return "peer"
+    if a.root_id != b.root_id:
+        return None
+    if a.parent_thread_id == b.thread_id:
+        return "parent"
+    if b.parent_thread_id == a.thread_id:
+        return "child"
+    if a.parent_thread_id is not None and a.parent_thread_id == b.parent_thread_id:
+        return "sibling"
+    return None
+
+
+def allowed(a, b, links=None) -> bool:
+    # Root contacts remain a directory feature, never an exception to delegation.
+    return relationship(a, b) not in {None, "self"}
+
+
+def describe(participant, *, viewer=None) -> dict:
+    from . import service
+
+    result = {"session_id": participant.row.session_id, "thread_id": participant.thread_id,
+              "root_thread_id": participant.root_id, "parent_session_id": participant.parent_session_id,
+              "parent_thread_id": participant.parent_thread_id,
+              "subagent_id": participant.subagent_id, "is_child": participant.is_child,
+              "title": participant.row.title, "source": service.surface(participant.row)}
+    if viewer is None:
+        return result
+    relation = relationship(viewer, participant)
+    if relation is None:
+        raise ValueError("Participant is outside the immediate communication neighborhood")
+    result["relation"] = relation
+    if viewer.is_child and viewer.parent_thread_id != participant.root_id:
+        result.pop("root_thread_id")
+    # Returning a visible parent's own parent would leak a grandparent address.
+    if participant.parent_thread_id not in {None, viewer.thread_id, viewer.parent_thread_id}:
+        result["parent_session_id"] = None
+        result["parent_thread_id"] = None
+    return result

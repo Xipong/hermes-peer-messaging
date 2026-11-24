@@ -132,7 +132,11 @@ def test_removed_legacy_wait_argument_is_rejected_and_explicit_ack_is_supported(
     sent = call("peer_send", "sender", target_session_id="recipient", message="Keep until explicit ACK")
     for args in ({"wait_seconds": 30}, {"current_session_id": "sender"}, {"wait_second": 30}):
         refused = call("peer_receive", "recipient", **args)
-        assert refused.get("success") is False and "error" in refused, refused
+        # Hermes rejects unknown parameters before invoking the plugin handler.
+        assert not refused.get("success") and "error" in refused, refused
+        assert next(iter(args)) in refused["error"], refused
+        assert "not a parameter of peer_receive" in refused["error"], refused
+        assert "tool was NOT invoked" in refused["error"], refused
     assert call("peer_receive", "recipient")["messages"][0]["message_id"] == sent["message_id"]
     assert call("peer_receive", "recipient", action="ack", message_ids=[sent["message_id"]])["acknowledged"] == [sent["message_id"]]
 

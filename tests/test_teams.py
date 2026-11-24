@@ -1,4 +1,4 @@
-"""Stored delegation provenance and direct, revocable team relationships."""
+"""Stored delegation provenance and immediate-family communication boundaries."""
 from importlib import import_module
 
 import pytest
@@ -29,13 +29,21 @@ def test_nested_children_keep_team_identity_when_parent_compresses(install):
         assert worker.root_id == root.thread_id == "sender"
         assert worker.root.session_id == root.row.session_id == "sender-tip"
         assert worker.parent_session_id == "a1"
+        assert worker.parent_thread_id == "a1"
         assert worker.thread_id == "nested"
-        assert teams.allowed(worker, root, {})
+        assert not teams.allowed(worker, root, {})
+        assert teams.allowed(worker, teams.resolve(store, "a1"), {})
         assert teams.describe(worker) == {
             "session_id": "nested", "thread_id": "nested", "root_thread_id": "sender",
-            "parent_session_id": "a1", "subagent_id": "task-nested", "is_child": True,
+            "parent_session_id": "a1", "parent_thread_id": "a1", "subagent_id": "task-nested", "is_child": True,
             "title": None, "source": "subagent",
         }
+        assert "root_thread_id" not in teams.describe(worker, viewer=worker)
+        visible_parent = teams.describe(teams.resolve(store, "a1"), viewer=worker)
+        assert visible_parent["relation"] == "parent"
+        assert visible_parent["parent_session_id"] is None
+        assert visible_parent["parent_thread_id"] is None
+        assert "root_thread_id" not in visible_parent
 
 
 def test_child_compression_follows_ancestry_not_reused_subagent_id(install):
@@ -69,7 +77,7 @@ def test_forked_child_cannot_inherit_a_team_or_its_inbox(install, kind):
                 teams.resolve(store, sid)
 
 
-def test_links_grant_direct_teams_only_and_revocation_is_immediate(install):
+def test_root_links_never_grant_access_to_other_teams_children(install):
     with open_persistence(profile_scope(home=install)) as store:
         store.sessions.create(NewSession("third", "cli", cwd="/project/third", git_repo_root="/project"))
         store.sessions.create(NewSession("branch", "cli", parent_session_id="sender",
@@ -84,13 +92,85 @@ def test_links_grant_direct_teams_only_and_revocation_is_immediate(install):
         assert not teams.allowed(a, b, links)
         links["recipient:sender"] = ["sender", "recipient"]
         links["recipient:third"] = ["recipient", "third"]
-        assert teams.allowed(a, b, links) and teams.allowed(b, c, links)
+        assert not teams.allowed(a, b, links) and not teams.allowed(b, c, links)
         assert not teams.allowed(a, c, links)
         assert branch.root_id == "branch" and not teams.allowed(branch, a, links)
         links.pop("recipient:sender")
         assert not teams.allowed(a, b, links)
         parent_a, parent_b = teams.resolve(store, "sender"), teams.resolve(store, "recipient")
         assert teams.allowed(parent_a, parent_b, links)
+
+
+def test_hierarchy_discovery_and_known_address_sends_share_the_same_boundary(install):
+    edges = (("a2", "sender"), ("b2", "sender"), ("a3", "a2"), ("a4", "a2"),
+             ("b3", "b2"), ("b4", "b2"), ("other-child", "recipient"))
+    with open_persistence(profile_scope(home=install)) as store:
+        for sid, parent in edges:
+            child(store, sid, parent)
+    assert call("link_thread", "sender", thread_id="recipient")["success"]
+    assert call("link_thread", "recipient", thread_id="sender")["status"] == "linked"
+    allowed_edges = {frozenset(edge) for edge in (
+        *edges, ("a2", "b2"), ("a3", "a4"), ("b3", "b4"), ("sender", "recipient"),
+    )}
+    participants = ["sender", "recipient", *(sid for sid, _ in edges)]
+    with open_persistence_reader(install) as store:
+        resolved = {sid: teams.resolve(store, sid) for sid in participants}
+        for sender in participants:
+            for target in participants:
+                assert teams.allowed(resolved[sender], resolved[target],
+                                     {"recipient:sender": ["recipient", "sender"]}) == (
+                    frozenset((sender, target)) in allowed_edges)
+    for sender in participants:
+        listed = call("peer_sessions", sender, scope="all", same_project=False)
+        assert listed.get("success"), listed
+        expected = {target for target in participants if frozenset((sender, target)) in allowed_edges}
+        # The fixture also has another independent root outside this graph.
+        actual = {peer["session_id"] for peer in listed["peers"]} & set(participants)
+        assert actual == expected
+        for target in participants:
+            if target == sender:
+                continue
+            result = call("peer_send", sender, target_session_id=target, message=f"{sender} to {target}")
+            assert result.get("success") == (target in expected), (sender, target, result)
+    folder = install / "runtime" / "peer_messages_v2"
+    for recipient in participants:
+        messages = call("peer_receive", recipient)["messages"]
+        assert all(frozenset((message["from_session_id"], recipient)) in allowed_edges for message in messages)
+        assert len(list((folder / recipient).glob("*.json"))) == sum(
+            recipient in edge for edge in allowed_edges)
+
+
+def test_immediate_family_survives_parent_and_child_compression_across_batches(install):
+    with open_persistence(profile_scope(home=install)) as store:
+        child(store, "coordinator", "sender")
+        child(store, "early", "coordinator", subagent_id="worker")
+        store.sessions.end("coordinator", "compression")
+        store.sessions.create(NewSession("coordinator-tip", "subagent", parent_session_id="coordinator",
+                                         model_config={"_delegate_from": "sender", "_subagent_id": "task-coordinator"}))
+        child(store, "late", "coordinator-tip")
+        store.sessions.end("early", "compression")
+        store.sessions.create(NewSession("early-tip", "subagent", parent_session_id="early",
+                                         model_config={"_delegate_from": "coordinator", "_subagent_id": "worker"}))
+        child(store, "uncle", "sender", subagent_id="worker")
+        child(store, "cousin", "uncle", subagent_id="worker")
+        store.sessions.end("sender", "compression")
+        store.sessions.create(NewSession("sender-tip", "cli", parent_session_id="sender"))
+    with open_persistence_reader(install) as store:
+        early, late = teams.resolve(store, "early"), teams.resolve(store, "late")
+        assert early.parent_session_id == "coordinator"
+        assert late.parent_session_id == "coordinator-tip"
+        assert early.parent_thread_id == late.parent_thread_id == "coordinator"
+        assert teams.relationship(early, late) == "sibling"
+        assert teams.relationship(early, teams.resolve(store, "coordinator")) == "parent"
+    for sender, target in (("early-tip", "late"), ("late", "early"),
+                           ("late", "coordinator"), ("coordinator-tip", "early")):
+        assert call("peer_send", sender, target_session_id=target, message="same family")["success"]
+    sent = call("peer_send", "early-tip", target_session_id="parent", message="report to coordinator")
+    assert sent["target_session_id"] == "coordinator-tip"
+    for target in ("sender", "sender-tip", "uncle", "cousin", "recipient"):
+        assert not call("peer_send", "early-tip", target_session_id=target, message="out of scope")["success"]
+    listed = call("peer_sessions", "early-tip", scope="all", same_project=False)
+    assert {peer["session_id"] for peer in listed["peers"]} == {"coordinator-tip", "late"}
 
 
 def test_unverified_or_foreign_parent_edges_never_grant_team_membership(install):

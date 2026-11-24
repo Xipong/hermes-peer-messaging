@@ -17,7 +17,7 @@ from persistence.conversation.sessions import (
 from persistence_assembly import open_persistence_reader, profile_scope, store_exists
 
 from . import mailbox
-from .discovery import CandidateCache, roster, scan
+from .discovery import CandidateCache, scan
 
 LOG = logging.getLogger(__name__)
 LOCAL = frozenset({"cli", "tui", "desktop", "gui"})
@@ -145,16 +145,15 @@ def discover(store, own, links, *, cutoff, same=True, scope="all", index=None,
         if not (ancestor and own_team) and active < cutoff and row.session_id not in live_owners:
             return
         seen.add(row.session_id)
-        peers.append({**teams.describe(participant), "hermes_project_id": index.named_id(participant.root),
+        peers.append({**teams.describe(participant, viewer=own), "hermes_project_id": index.named_id(participant.root),
                       "cwd": row.cwd, "git_repo_root": row.git_repo_root, "last_active": active,
                       "last_activity_description": row.last_activity_description})
 
     if own.is_child:
-        add(own.root.session_id, ancestor=True)
         add(own.parent_session_id, ancestor=True)
     for candidate, last_active in snapshot.candidates:
         add(candidate, last_active=last_active)
-    peers.sort(key=lambda peer: (peer["root_thread_id"] == own.root_id, peer["last_active"]), reverse=True)
+    peers.sort(key=lambda peer: (peer["relation"] != "peer", peer["last_active"]), reverse=True)
     return peers, list(snapshot.limited_sources)
 
 
@@ -168,27 +167,29 @@ def sessions(args, sid):
         raise ValueError("Use scope roots/team/all, active_within_minutes 1–1440, and boolean same_project")
     home = get_hermes_home()
     index = ProjectIndex(home)
-    with threads.graph(home) as links, open_persistence_reader(home) as store:
+    with open_persistence_reader(home) as store:
         own = teams.resolve(store, sid)
         snapshot = DISCOVERY_CACHE.get(home, store, now=time.monotonic(), max_age=DISCOVERY_INTERVAL,
                                        owner_loader=owners, refresh=True, roots_only=scope == "roots")
         live = snapshot.live_owners
-        peers, limited = discover(store, own, links, cutoff=time.time() - minutes * 60, same=same,
+        peers, limited = discover(store, own, {}, cutoff=time.time() - minutes * 60, same=same,
                                   scope=scope, index=index, live_owners=live, snapshot=snapshot)
-        directory = threads.directory(store, own, links)
+        directory = []
+        if not own.is_child:
+            with threads.graph(home) as links:
+                directory = threads.directory(store, own, links)
     for peer in peers:
         peer["owner_present"] = None if live is None else peer["session_id"] in live
-    return {"success": True, **teams.describe(own), "hermes_project_id": index.named_id(own.root),
+    return {"success": True, **teams.describe(own, viewer=own), "hermes_project_id": index.named_id(own.root),
             "count": len(peers), "peers": peers, "links": directory, "scope": scope,
             "same_project": same, "scan_may_be_truncated": bool(limited), "scan_limited_sources": limited}
 
 
 def send(args, sid):
-    from . import teams, threads
+    from . import teams
 
     home, requested = get_hermes_home(), args.get("target_session_id")
-
-    def resolve(store):
+    with open_persistence_reader(home, patience_s=0.1) as store:
         sender = teams.resolve(store, sid)
         target_id = requested
         if requested == "parent":
@@ -198,30 +199,17 @@ def send(args, sid):
         target = teams.resolve(store, target_id)
         if sender.thread_id == target.thread_id:
             raise ValueError("Send to another conversation, not your own")
-        return sender, target
-
-    def publish(sender, target, links):
-        if not teams.allowed(sender, target, links):
-            raise ValueError("These teams are not linked. Both independent parents must use link_thread.")
-        return mailbox.enqueue(root(home) / target.thread_id, sender=sender.row.session_id,
-                               target=target.row.session_id, text=args.get("message"),
-                               in_reply_to=args.get("in_reply_to"))
-
-    with open_persistence_reader(home, patience_s=0.1) as store:
-        sender, target = resolve(store)
-        needs_link = sender.root_id != target.root_id and (sender.is_child or target.is_child)
-        if not needs_link:
-            entry = publish(sender, target, {})
-    if needs_link:
-        # Both mutations acquire the graph before the persistence reader. Re-resolve
-        # identities under that lock; revocation cannot race accepted publication.
-        with threads.graph(home, locked=True) as links, open_persistence_reader(home, patience_s=0.1) as store:
-            sender, target = resolve(store)
-            entry = publish(sender, target, links)
+        if not teams.allowed(sender, target):
+            raise ValueError("You can message only your immediate parent, direct children, or siblings with the same parent. "
+                             "Independent root chats can message each other. Escalate other issues through your parent; "
+                             "root contacts do not grant access to other branches.")
+        entry = mailbox.enqueue(root(home) / target.thread_id, sender=sender.row.session_id,
+                                target=target.row.session_id, text=args.get("message"),
+                                in_reply_to=args.get("in_reply_to"))
     return {"success": True, "status": "queued", "message_id": entry["message_id"],
             "target_session_id": target.row.session_id, "requested_target_session_id": requested,
-            "from_session_id": sender.row.session_id, "from_root_thread_id": sender.root_id,
-            "target_root_thread_id": target.root_id}
+            "from_session_id": sender.row.session_id, "from_thread_id": sender.thread_id,
+            "target_thread_id": target.thread_id}
 
 
 def receive(args, sid):
@@ -308,11 +296,7 @@ class InboxNotices:
                 self._put(self.seen, key, True)
             if previous or listed is not None:
                 return {}
-            try:
-                parent = teams.resolve(store, own.parent_session_id, allow_ended=True).thread_id
-            except ValueError:
-                parent = own.parent_session_id  # Already verified delegation edge.
-            return {"parent": parent, "root": own.root_id}
+            return {"parent": own.parent_thread_id}
 
         shown = {peer["thread_id"] for peer in listed.get("peers", ())
                  if not peer["is_child"]} if listed is not None else set()
@@ -461,16 +445,18 @@ def register(ctx):
                           check_fn=requirements, description="Local peer messaging", emoji=emoji)
 
     tool("peer_sessions", sessions,
-         "Find exact addresses and link offers. scope=roots lists independent chats; team lists your team; all includes linked teams. "
-         "same_project=false searches the profile. peer_update announces new roots (or your parent) and incoming links; "
-         "has_more means consult this directory. Presence is not proof of a running turn.", {
+         "Find permitted contacts: your immediate parent, direct children, and siblings with the same parent. "
+         "Independent root chats also see other roots. scope=roots selects permitted roots; team selects your local family; "
+         "all includes every permitted type. same_project=false expands search, never access. Root contact offers appear in links. "
+         "peer_update announces new roots or your parent; has_more means consult this directory. Presence is not a running turn.", {
              "scope": {"type": "string", "enum": ["roots", "team", "all"], "default": "all"},
              "active_within_minutes": {"type": "integer", "minimum": 1, "maximum": 1440, "default": 60},
              "same_project": {"type": "boolean", "default": True},
          })
     tool("peer_send", send,
-         "Queue a coordination note to a known session_id/thread_id or parent. Own team and root-to-root mail need no link; "
-         "cross-team child mail needs a mutual parent link. Reply to from_session_id with in_reply_to. "
+         "Queue a note to a known session_id/thread_id or parent: immediate parent, direct child, same-parent sibling, "
+         "or another independent root if you are a root. Known IDs and root links do not bypass these limits. "
+         "Escalate shared issues to your parent so coordinators can inform the affected branches. Reply with in_reply_to. "
          "Queued is not read; never wakes the recipient. Continue your task.", {
              "target_session_id": {"type": "string", "description": "Exact address or parent (immediate delegation parent)."},
              "message": {"type": "string", "minLength": 1, "maxLength": mailbox.MAX_MESSAGE_CHARS},
@@ -485,8 +471,9 @@ def register(ctx):
                              "items": {"type": "string"}},
          }, emoji="📥")
     tool("link_thread", threads.link,
-         "Independent parents can offer or revoke a direct team link. Both must offer; links are not transitive. "
-         "Use peer_sessions to inspect offers. Links allow cross-team mail, not transcript access or wake.", {
+         "Independent root chats can offer or revoke a stable coordinator contact. Both must offer for linked status. "
+         "peer_sessions keeps these contacts outside project and activity filters. Roots can already message each other; "
+         "contacts never grant access to children or other branches, read transcripts, or wake agents.", {
              "thread_id": {"type": "string", "description": "Exact independent thread_id or session_id"},
              "action": {"type": "string", "enum": ["offer", "unlink"], "default": "offer"},
          }, ("thread_id",), "🧵")

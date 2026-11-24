@@ -35,12 +35,18 @@ def test_explicit_project_spans_separate_repositories_and_delegated_teams(instal
     assert not call("peer_send", "a-child", target_session_id="b-child", message="not linked")["success"]
     assert call("link_thread", "sender", thread_id="frontend")["status"] == "awaiting_other_chat"
     assert call("link_thread", "frontend", thread_id="sender")["status"] == "linked"
-    assert {p["session_id"] for p in call("peer_sessions", "a-child")["peers"]} >= {
-        "sender", "frontend", "b-child",
-    }
-    sent = call("peer_send", "a-child", target_session_id="b-child", message="We own the API changes")
+    for same_project in (True, False):
+        child = call("peer_sessions", "a-child", same_project=same_project)
+        assert child["hermes_project_id"] == project_id
+        assert {p["session_id"] for p in child["peers"]} == {"sender"}
+        assert child["links"] == []
+    assert not call("peer_send", "a-child", target_session_id="b-child", message="Project and contacts do not widen family")["success"]
+    sent = call("peer_send", "sender", target_session_id="frontend", message="We own the API changes")
     assert sent["status"] == "queued"
-    assert call("peer_receive", "b-child")["messages"][0]["message_id"] == sent["message_id"]
+    assert call("peer_receive", "frontend")["messages"][0]["message_id"] == sent["message_id"]
+    forwarded = call("peer_send", "frontend", target_session_id="b-child", message="Handle the frontend changes",
+                     in_reply_to=sent["message_id"])
+    assert call("peer_receive", "b-child")["messages"][0]["message_id"] == forwarded["message_id"]
 
 
 def test_nested_named_project_takes_precedence_over_shared_git_root(install):

@@ -1,8 +1,8 @@
 name: peer-messaging
-version: 0.9.0
+version: 0.10.0
 manifest_version: 2
 api_version: 1
-description: Passive local peer mail, root-only discovery and explicit team links.
+description: Passive local peer mail with immediate-family boundaries and root coordinator contacts.
 license: MIT
 author: Xipong
 provides_tools:
