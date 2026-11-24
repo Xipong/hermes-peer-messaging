@@ -87,10 +87,11 @@ class _Resolver:
     def local(self, row, *, follow=True):
         # Import lazily: service dispatch uses this resolver, while the existing
         # local route remains the authority for supported conversation surfaces.
-        from . import service, threads
+        from . import threads
 
-        current = service.route(self.store, row.session_id, follow=follow, allow_ended=self.allow_ended)
-        root_id, current = threads.locate(self.store, current.session_id, allow_ended=self.allow_ended)
+        root_id, current = threads.locate(self.store, row.session_id, allow_ended=self.allow_ended)
+        if not follow and current.session_id != row.session_id:
+            raise ValueError("This chat rotated; use its current session")
         current = self.get(current.session_id)
         # locate already stopped at an archived, foreign, or ineligible ancestor.
         # The inbox walk must preserve that boundary and keep own mail usable.

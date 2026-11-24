@@ -23,13 +23,13 @@ _MAX_TEXT = 3000
 
 
 @contextmanager
-def graph(home, *, write=False):
+def graph(home, *, write=False, locked=False):
     folder = service.root(home)
     path = folder / ".threads.json"
     lock = folder / ".threads.lock"
     if path.is_symlink() or lock.is_symlink():
         raise ValueError("Thread link storage must not be a symlink")
-    if write:
+    if write or locked:
         folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     def load():
         try:
@@ -43,13 +43,19 @@ def graph(home, *, write=False):
         if not isinstance(value, dict) or value.get("version") != 1 or not isinstance(value.get("links"), dict):
             raise ValueError("Invalid thread link store")
         return value["links"]
-    if not write:
+    if not (write or locked):
         yield load()  # Atomic publication gives readers a complete old or new snapshot.
         return
-    with _FileLock(lock, timeout=2.0):
-        links = load()
-        yield links
-        atomic_json_write(path, {"version": 1, "links": links}, indent=None, mode=0o600)
+    try:
+        with _FileLock(lock, timeout=2.0):
+            links = load()
+            yield links
+            if write:
+                atomic_json_write(path, {"version": 1, "links": links}, indent=None, mode=0o600)
+    except RuntimeError as exc:
+        if isinstance(exc.__cause__, BlockingIOError):
+            raise TimeoutError("Peer links are busy; retry the operation") from exc
+        raise
 
 
 def locate(store, sid, *, allow_ended=False):
@@ -342,9 +348,9 @@ def register(ctx):
     add("list_threads", list_threads, "List your team's directly linked local parent chats and pending offers. Delegated agents inherit their root parent's directory. No wake.", {})
     add("link_thread", link, "For independent local parents in one profile: propose or revoke a link between teams. Both must offer; links are not transitive. Linked teams can message each other across projects. Only links formed in the same project can share new public parent text. No prompt is sent.",
         {"thread_id": id_field, "action": {"type": "string", "enum": ["offer", "unlink"]}}, ("thread_id",))
-    add("read_thread", read_thread, "For independent parents: read bounded public text after a shared-transcript link in the same project. Mail-only links do not grant access. Delegated agents use peer_receive. scan_limited_roles reports incomplete scans. No raw tool results, reasoning, or wake.",
+    add("read_thread", read_thread, "For independent parents: read bounded public text after a shared-transcript link in the same project. Mail-only links do not grant access. Delegated agents receive mail as peer_data with their tool results. scan_limited_roles reports incomplete scans. No raw tool results, reasoning, or wake.",
         {"thread_id": id_field, "limit": {"type": "integer", "minimum": 1, "maximum": 10}}, ("thread_id",))
-    add("wait_threads", wait_threads, "For independent parents: wait up to 30 seconds for a same-project parent's saved final newer than the cursor on a shared-transcript link. Use peer_receive(wait_seconds=...) for mail replies. scan_limit reports an incomplete search. Does not launch or resume anyone.",
+    add("wait_threads", wait_threads, "For independent parents: wait up to 30 seconds for a same-project parent's saved final newer than the cursor on a shared-transcript link. Mail replies arrive as peer_data with ordinary tool results; do not use this to poll the inbox or track child completion. scan_limit reports an incomplete search. Does not launch or resume anyone.",
         {"threads": {"type": "array", "minItems": 1, "maxItems": 5, "items": {"type": "object", "properties": {
             "thread_id": id_field, "after_row_id": {"type": "integer", "minimum": 0}}, "required": ["thread_id"], "additionalProperties": False}},
          "wait_seconds": {"type": "number", "minimum": 0, "maximum": 30}}, ("threads",))
