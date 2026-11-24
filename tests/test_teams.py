@@ -104,7 +104,7 @@ def test_hierarchy_discovery_and_known_address_sends_share_the_same_boundary(ins
         for target in participants:
             if target == sender:
                 continue
-            result = call("peer_send", sender, target_session_id=target, message=f"{sender} to {target}")
+            result = call("peer_send", sender, target_session_ids=[target], message=f"{sender} to {target}")
             assert result.get("success") == (target in expected), (sender, target, result)
     folder = install / "runtime" / "peer_messages_v2"
     for recipient in participants:
@@ -138,11 +138,11 @@ def test_immediate_family_survives_parent_and_child_compression_across_batches(i
         assert teams.relationship(early, teams.resolve(store, "coordinator")) == "parent"
     for sender, target in (("early-tip", "late"), ("late", "early"),
                            ("late", "coordinator"), ("coordinator-tip", "early")):
-        assert call("peer_send", sender, target_session_id=target, message="same family")["success"]
-    sent = call("peer_send", "early-tip", target_session_id="parent", message="report to coordinator")
+        assert call("peer_send", sender, target_session_ids=[target], message="same family")["success"]
+    sent = call("peer_send", "early-tip", target_session_ids=["parent"], message="report to coordinator")["results"][0]
     assert sent["target_session_id"] == "coordinator-tip"
     for target in ("sender", "sender-tip", "uncle", "cousin", "recipient"):
-        assert not call("peer_send", "early-tip", target_session_id=target, message="out of scope")["success"]
+        assert not call("peer_send", "early-tip", target_session_ids=[target], message="out of scope")["success"]
     listed = call("peer_sessions", "early-tip", scope="all", same_project=False)
     assert {peer["session_id"] for peer in listed["peers"]} == {"coordinator-tip", "late"}
 
@@ -211,8 +211,8 @@ def test_local_inbox_stops_at_validated_root_and_keeps_own_mail_usable(install, 
     assert receipt["acknowledged"] == [own_mail["message_id"]]
     assert receipt["not_pending"] == [old_mail["message_id"]]
     assert (inbox / "old" / f"{old_mail['message_id']}.json").exists()
-    assert call("peer_send", "sender", target_session_id="tip", message="fresh mail")["success"]
-    assert not call("peer_send", "sender", target_session_id="old", message="invalid old alias")["success"]
+    assert call("peer_send", "sender", target_session_ids=["tip"], message="fresh mail")["success"]
+    assert not call("peer_send", "sender", target_session_ids=["old"], message="invalid old alias")["success"]
 
 
 def test_child_compression_does_not_skip_an_ineligible_ownership_segment(install):

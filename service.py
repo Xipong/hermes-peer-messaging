@@ -20,6 +20,7 @@ from .project_identity import ProjectIndex
 
 LOG = logging.getLogger(__name__)
 TOOLSET = "peer_messaging"
+MAX_RECIPIENTS = 16
 HINT = "Peer mail pending. Use peer_receive only if needed before your next tool result."
 DISCOVERY_INTERVAL = 5.0
 DISCOVERY_CACHE = CandidateCache()
@@ -116,27 +117,59 @@ def sessions(args, sid):
 
 
 def send(args, sid):
-    home, requested = get_hermes_home(), args.get("target_session_id")
+    requested = args.get("target_session_ids")
+    if (not isinstance(requested, list) or not 1 <= len(requested) <= MAX_RECIPIENTS
+            or any(not isinstance(address, str) or not 1 <= len(address) <= 128 for address in requested)):
+        raise ValueError(f"target_session_ids must contain 1–{MAX_RECIPIENTS} nonempty addresses")
+    reply_to = args.get("in_reply_to")
+    message = mailbox.validate_message(args.get("message"), reply_to)
+    home = get_hermes_home()
+    folder = mailbox.root(home)
+    results, seen = [], {}
+    queued = 0
     with open_persistence_reader(home, patience_s=0.1) as store:
         sender = teams.resolve(store, sid)
-        target_id = requested
-        if requested == "parent":
-            if sender.parent_session_id is None:
-                raise ValueError("This conversation has no delegation parent")
-            target_id = sender.parent_session_id
-        target = teams.resolve(store, target_id)
-        if sender.thread_id == target.thread_id:
-            raise ValueError("Send to another conversation, not your own")
-        if not teams.allowed(sender, target):
-            raise ValueError("Recipient is outside your communication neighborhood; coordinate through your parent.")
-        entry = mailbox.enqueue(mailbox.root(home) / target.thread_id, sender=sender.row.session_id,
-                                target=target.row.session_id, text=args.get("message"),
-                                in_reply_to=args.get("in_reply_to"))
-        state = lifecycle.recipient_state(store, target, owners(home))
-    return {"success": True, "status": "queued", "recipient_state": state, "message_id": entry["message_id"],
-            "target_session_id": target.row.session_id, "requested_target_session_id": requested,
-            "from_session_id": sender.row.session_id, "from_thread_id": sender.thread_id,
-            "target_thread_id": target.thread_id}
+        live = owners(home)
+        for address in requested:
+            result = {"requested_target_session_id": address}
+            canonical = None
+            try:
+                target_id = address
+                if address == "parent":
+                    if sender.parent_session_id is None:
+                        raise ValueError("This conversation has no delegation parent")
+                    target_id = sender.parent_session_id
+                target = teams.resolve(store, target_id)
+                if sender.thread_id == target.thread_id:
+                    raise ValueError("Send to another conversation, not your own")
+                if not teams.allowed(sender, target):
+                    raise ValueError("Recipient is outside your communication neighborhood; coordinate through your parent.")
+                canonical = target.thread_id
+                if canonical in seen:
+                    prior = seen[canonical]
+                    results.append({**prior, "requested_target_session_id": address,
+                                    "duplicate_of": prior["requested_target_session_id"]})
+                    continue
+                result.update(target_session_id=target.row.session_id, target_thread_id=canonical)
+                state = lifecycle.recipient_state(store, target, live)
+                entry = mailbox.enqueue(folder / canonical, sender=sender.row.session_id,
+                                        target=target.row.session_id, text=message, in_reply_to=reply_to)
+                result.update(status="queued", message_id=entry["message_id"], recipient_state=state)
+                queued += 1
+            except (TimeoutError, StoreContention) as exc:
+                result.update(status="failed", error=str(exc), retryable=True)
+            except (ValueError, OSError) as exc:
+                result.update(status="failed", error=str(exc))
+            except Exception:
+                LOG.exception("Peer send to %s failed", address)
+                result.update(status="failed", error="Peer messaging storage unavailable")
+            if canonical is not None:
+                seen[canonical] = result
+            results.append(result)
+    success = all(item["status"] == "queued" for item in results)
+    return {"success": success, "status": "queued" if success else "partial" if queued else "failed",
+            "queued_count": queued, "from_session_id": sender.row.session_id,
+            "from_thread_id": sender.thread_id, "results": results}
 
 
 def receive(args, sid):
@@ -365,12 +398,17 @@ def register(ctx):
                               "description": "Filter other roots by project only."},
          })
     tool("peer_send", send,
-         "Queue coordination mail. Raise cross-branch issues via your parent; delegate_task returns final summaries. "
-         "Queued means stored, not read; recipients are not woken. recipient_state is advisory. Continue work without polling.", {
-             "target_session_id": {"type": "string", "description": "Known session_id/thread_id or parent (immediate parent)."},
+         "Send a decision, blocker, or handoff; combine routine progress at checkpoints. "
+         "If a delay would block someone, send now. Otherwise, include the send in the same batch as your next independent work tool when possible. "
+         "Raise cross-branch issues via your parent; delegate_task returns final summaries. "
+         "Queued means stored, not read; recipients are not woken. Check results and retry only failed addresses if needed. "
+         "recipient_state is advisory. Continue work without polling.", {
+             "target_session_ids": {"type": "array", "minItems": 1, "maxItems": MAX_RECIPIENTS,
+                                    "items": {"type": "string", "minLength": 1, "maxLength": 128},
+                                    "description": "Known session_ids/thread_ids or parent (immediate parent). All receive the same message."},
              "message": {"type": "string", "minLength": 1, "maxLength": mailbox.MAX_MESSAGE_CHARS},
              "in_reply_to": {"type": "string", "description": "ID of the message being answered."},
-         }, ("target_session_id", "message"), "📨")
+         }, ("target_session_ids", "message"), "📨")
     tool("peer_receive", receive,
          "Read mail if needed now, or ACK fully read duplicates. Normally delivery and ACK are automatic.", {
              "action": {"type": "string", "enum": ["read", "ack"], "default": "read"},

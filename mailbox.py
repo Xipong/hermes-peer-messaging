@@ -138,11 +138,7 @@ def _load(path: Path) -> dict[str, Any] | None:
             "sent_at": entry.get("sent_at"), "in_reply_to": entry.get("in_reply_to")}
 
 
-def enqueue(inbox: Path, *, sender: str, target: str, text: str,
-            in_reply_to: str | None = None) -> dict[str, Any]:
-    """Publish under the existing process-shared lock; concurrent sends share the cap."""
-    session_component(sender)
-    session_component(target)
+def validate_message(text, in_reply_to=None) -> str:
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_MESSAGE_CHARS:
         raise ValueError(f"message must contain 1–{MAX_MESSAGE_CHARS} characters")
     # Lone surrogates trigger the host writer's whole-envelope ASCII fallback,
@@ -154,6 +150,15 @@ def enqueue(inbox: Path, *, sender: str, target: str, text: str,
         raise ValueError("message must contain valid UTF-8 text") from exc
     if in_reply_to is not None:
         message_id(in_reply_to)
+    return text.strip()
+
+
+def enqueue(inbox: Path, *, sender: str, target: str, text: str,
+            in_reply_to: str | None = None) -> dict[str, Any]:
+    """Publish under the existing process-shared lock; concurrent sends share the cap."""
+    session_component(sender)
+    session_component(target)
+    text = validate_message(text, in_reply_to)
     if inbox.is_symlink():
         raise ValueError("Peer inbox must not be a symlink")
     inbox.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -165,7 +170,7 @@ def enqueue(inbox: Path, *, sender: str, target: str, text: str,
         while (inbox / f"{key}.json").exists() or (archived / f"{key}.json").exists():
             key = f"{time.time_ns():020d}_{uuid.uuid4().hex[:8]}"
         entry = {"message_id": key, "from_session_id": sender, "target_session_id": target,
-                 "message": text.strip(), "sent_at": time.time(), "in_reply_to": in_reply_to}
+                 "message": text, "sent_at": time.time(), "in_reply_to": in_reply_to}
         atomic_json_write(inbox / f"{key}.json", entry, indent=None, mode=0o600)
         return entry
 

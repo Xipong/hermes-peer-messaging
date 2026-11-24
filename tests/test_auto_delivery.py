@@ -22,8 +22,8 @@ def pending(home):
 
 
 def queue(message="A peer finding; continue the existing task"):
-    sent = call("peer_send", "sender", target_session_id="recipient", message=message)
-    assert sent.get("success"), sent
+    sent = call("peer_send", "sender", target_session_ids=["recipient"], message=message)["results"][0]
+    assert sent["status"] == "queued", sent
     return sent["message_id"]
 
 
@@ -346,9 +346,11 @@ def test_one_large_escaped_envelope_remains_deliverable_without_truncation(insta
     assert key not in {message["message_id"] for message in pending(install)["messages"]}
 
 
-@pytest.mark.parametrize(("persisted", "fallback"), [(True, False), (False, False), (True, True)],
-                         ids=["ordinary-durable", "failed-flush", "receive-fallback"])
-def test_real_executor_and_host_request_hooks_require_durable_delivery(install, wrapped_tool, persisted, fallback):
+@pytest.mark.parametrize(("persisted", "fallback", "send_with_work"), [
+    (True, False, False), (False, False, False), (True, True, False), (True, False, True),
+], ids=["ordinary-durable", "failed-flush", "receive-fallback", "outbound-with-ordinary-work"])
+def test_real_executor_and_host_request_hooks_require_durable_delivery(
+        install, wrapped_tool, persisted, fallback, send_with_work):
     from agent import tool_executor
     from agent.turn_api_request import _fire_pre_api_request_hook
     from agent.turn_response_intake import _fire_post_api_request_hook
@@ -375,9 +377,14 @@ def test_real_executor_and_host_request_hooks_require_durable_delivery(install, 
         agent._current_turn_id, agent._current_api_request_id = "active-turn", "producing-request"
         tc = SimpleNamespace(id="work-call", type="function",
                              function=SimpleNamespace(name="peer_receive" if fallback else wrapped_tool, arguments="{}"))
+        calls = [tc]
+        coordination = "The QA window is free; use the approved build."
+        if send_with_work:
+            calls.append(SimpleNamespace(id="send-call", type="function", function=SimpleNamespace(
+                name="peer_send", arguments=json.dumps({"target_session_ids": ["sender", "elsewhere"], "message": coordination}))))
         rows = [{"role": "user", "content": "Continue my existing authorized task"},
                 {"role": "assistant", "content": None, "tool_calls": [
-                    {"id": tc.id, "type": tc.type, "function": vars(tc.function)},
+                    {"id": call.id, "type": call.type, "function": vars(call.function)} for call in calls
                 ]}]
         original = deepcopy(rows)
         flush = agent._flush_messages_to_session_db
@@ -389,12 +396,22 @@ def test_real_executor_and_host_request_hooks_require_durable_delivery(install, 
 
         try:
             with patch.object(agent, "_flush_messages_to_session_db", side_effect=flush_result):
-                tool_executor.execute_tool_calls_sequential(agent, SimpleNamespace(tool_calls=[tc]), rows,
+                tool_executor.execute_tool_calls_sequential(agent, SimpleNamespace(tool_calls=calls), rows,
                                                             "recipient-task", finalize=False)
-            assert [(row["role"], row["content"]) for row in rows[:-1]] == [
+            assert [(row["role"], row["content"]) for row in rows[:-len(calls)]] == [
                 (row["role"], row["content"]) for row in original]
-            tool = rows[-1]
+            tool = rows[len(original)]
             assert tool["role"] == "tool" and tool["tool_call_id"] == tc.id
+            if send_with_work:
+                assert rows[-1]["tool_call_id"] == "send-call"
+                sent = json.loads(rows[-1]["content"])
+                assert sent["status"] == "queued" and "peer_data" not in sent
+                assert sent["queued_count"] == 2
+                mailbox = import_module("peer-messaging.mailbox")
+                assert {item["target_session_id"] for item in sent["results"]} == {"sender", "elsewhere"}
+                for item in sent["results"]:
+                    letters = mailbox.read_pending(inbox(install).with_name(item["target_session_id"]))["messages"]
+                    assert [(m["message_id"], m["message"]) for m in letters] == [(item["message_id"], coordination)]
             if fallback:
                 assert tool["content"].startswith("{")
             else:
