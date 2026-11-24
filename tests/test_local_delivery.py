@@ -186,7 +186,6 @@ def test_send_array_contract_and_shared_validation_before_publication(install):
     assert set(schema["properties"]) == {"target_session_ids", "message", "in_reply_to"}
     for args in (
         {"target_session_id": "recipient", "message": "old argument"},
-        {"target_session_ids": "recipient", "message": "not an array"},
         {"target_session_ids": [], "message": "empty"},
         {"target_session_ids": ["recipient"] * 17, "message": "too many"},
         {"target_session_ids": ["recipient", 1], "message": "invalid type"},
@@ -203,3 +202,13 @@ def test_send_array_contract_and_shared_validation_before_publication(install):
     for item in sent["results"]:
         messages = call("peer_receive", item["target_session_id"])["messages"]
         assert [(m["message_id"], m["message"]) for m in messages] == [(item["message_id"], "Shared notice")]
+
+
+def test_send_handler_requires_an_array_before_host_coercion(install):
+    # Hermes can wrap an unencoded string into an array before dispatch. Test this shape at the handler boundary.
+    service = import_module("peer-messaging.service")
+    refused = json.loads(service.handler(service.send)(
+        {"target_session_ids": "recipient", "message": "not an array"}, session_id="sender"))
+    assert refused["success"] is False
+    assert "target_session_ids" in refused["error"]
+    assert call("peer_receive", "recipient")["messages"] == []
