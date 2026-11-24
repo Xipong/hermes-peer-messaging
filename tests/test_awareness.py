@@ -1,5 +1,7 @@
 """Proactive local discovery and incoming-link awareness through native hooks."""
 import json
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from importlib import import_module
 from types import SimpleNamespace
 
@@ -184,3 +186,34 @@ def test_long_running_owner_not_hidden_by_default_recency_cutoff(install):
     assert [peer["session_id"] for peer in leased] == ["sender"]
     # A registered owner is NOT evidence of an in-flight LLM request.
     assert leased[0]["last_active"] < future_cutoff
+
+
+def test_awareness_observes_old_live_owners_without_waiting_for_registry_writer(install, monkeypatch):
+    from hermes_cli.active_sessions import _FileLock, _lock_path, _state_path, try_acquire_active_session
+
+    service = import_module("peer-messaging.service")
+    pin(install, "recipient", ("peer_sessions",))
+    lease, error = try_acquire_active_session(
+        session_id="sender", surface="cli", config={}, registry_home=install, track_liveness=True,
+    )
+    assert error is None and lease is not None
+    registry = _state_path(install)
+    before, modified = registry.read_bytes(), registry.stat().st_mtime_ns
+    clock = service.time
+    monkeypatch.setattr(service, "time", SimpleNamespace(
+        time=lambda: clock.time() + 7200, monotonic=clock.monotonic,
+    ))
+    notices = service.InboxNotices()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            with _FileLock(_lock_path(install), timeout=1.0):
+                future = executor.submit(
+                    copy_context().run, notices.before_turn,
+                    session_id="recipient", turn_id="old-owner-turn", platform="desktop",
+                )
+                # The registry writer can remain busy while this normal hook
+                # discovers a live owner outside the persisted recency window.
+                assert future.result(timeout=2.0) == {"context": service.DISCOVERY_HINT}
+        assert registry.read_bytes() == before and registry.stat().st_mtime_ns == modified
+    finally:
+        lease.release()

@@ -1,4 +1,4 @@
-"""New mail becomes visible during a running turn through a content-free tool notice."""
+"""New mail rides existing tool results, with content-free fallback notices."""
 import json
 from importlib import import_module
 
@@ -24,18 +24,24 @@ def pin_receive(home, sid="recipient"):
         store.sessions.update_tool_pin(sid, {"tools": [{"function": {"name": "peer_receive"}}]})
 
 
-def test_new_mail_notifies_a_running_turn_without_payload_or_wake(install):
+def test_new_mail_rides_a_running_tool_result_without_wake(install):
     pin_receive(install)
-    assert "_peer_inbox_notice" not in poll()
+    assert not {"_peer_inbox_notice", "peer_data"} & poll().keys()
     first = call("peer_send", "sender", target_session_id="recipient", message="private-note-one")
     noticed = poll()
-    assert noticed["success"] and "peer_receive" in noticed["_peer_inbox_notice"]
-    assert "private-note-one" not in json.dumps(noticed)
-    assert "_peer_inbox_notice" not in poll()
+    assert noticed["success"] and "_peer_inbox_notice" not in noticed
+    assert [message["message"] for message in noticed["peer_data"]["messages"]] == ["private-note-one"]
+    assert not {"_peer_inbox_notice", "peer_data"} & poll().keys()
 
     second = call("peer_send", "sender", target_session_id="recipient", message="private-note-two")
-    assert poll()["_peer_inbox_notice"] == noticed["_peer_inbox_notice"]
-    assert poll(turn="next-turn")["_peer_inbox_notice"] == noticed["_peer_inbox_notice"]
+    # The same tool call cannot receive a second carrier before its request.
+    fallback = poll()
+    assert "peer_receive" in fallback["_peer_inbox_notice"] and "peer_data" not in fallback
+    assert "private-note-two" not in json.dumps(fallback)
+    next_turn = poll(turn="next-turn")
+    assert [message["message_id"] for message in next_turn["peer_data"]["messages"]] == [
+        first["message_id"], second["message_id"],
+    ]
     with open_persistence_reader(install) as store:
         assert store.sessions.get("recipient").message_count == 0
     page = call("peer_receive", "recipient")
@@ -44,12 +50,12 @@ def test_new_mail_notifies_a_running_turn_without_payload_or_wake(install):
     assert "_peer_inbox_notice" not in poll()
 
 
-def test_mid_turn_notices_require_the_recipient_tool_pin(install):
+def test_mid_turn_delivery_requires_the_recipient_tool_pin(install):
     call("peer_send", "sender", target_session_id="recipient", message="pending")
-    assert "_peer_inbox_notice" not in poll()
+    assert not {"_peer_inbox_notice", "peer_data"} & poll().keys()
     pin_receive(install)
-    assert "_peer_inbox_notice" in poll()
-    assert "_peer_inbox_notice" not in poll(sid="elsewhere")
+    assert "peer_data" in poll()
+    assert not {"_peer_inbox_notice", "peer_data"} & poll(sid="elsewhere").keys()
     assert call("peer_receive", "recipient")["pending_count"] == 1
 
 
@@ -76,10 +82,12 @@ def test_delegated_agent_notices_only_its_own_mail(install):
         ))
     pin_receive(install, "child")
     call("peer_send", "recipient", target_session_id="sender", message="parent-only")
-    assert "_peer_inbox_notice" not in poll(sid="child")
+    assert not {"_peer_inbox_notice", "peer_data"} & poll(sid="child").keys()
     sent = call("peer_send", "sender", target_session_id="child", message="child-only")
     assert sent["success"]
-    assert "_peer_inbox_notice" in poll(sid="child")
+    carried = poll(sid="child")
+    assert [message["message"] for message in carried["peer_data"]["messages"]] == ["child-only"]
+    assert "parent-only" not in json.dumps(carried)
     hints = [value for value in invoke_hook("pre_llm_call", session_id="child", platform="subagent") if value]
     assert len(hints) == 1 and "peer_receive" in hints[0]["context"]
     assert [m["message"] for m in call("peer_receive", "child")["messages"]] == ["child-only"]

@@ -24,17 +24,18 @@ def _send_worker(args):
 def _contended_worker(inbox, operation, key, ready, done, result):
     inbox = Path(inbox)
     ready.set()
+    snapshot = None
     try:
         if operation == "send":
             _send(inbox, "must not be queued while busy")
         elif operation == "read":
-            box.read_pending([inbox])
+            snapshot = box.read_pending([inbox])
         else:
             box.acknowledge([inbox], [key])
     except Exception as exc:
         result.put((type(exc).__name__, str(exc)))
     else:
-        result.put((None, None))
+        result.put((None, snapshot))
     finally:
         done.set()
 
@@ -130,7 +131,7 @@ def test_concurrent_processes_cannot_overfill_or_overwrite(tmp_path):
 
 
 @pytest.mark.parametrize("operation", ["send", "read", "ack"])
-def test_contended_mailbox_returns_for_retry_without_consuming_mail(tmp_path, operation):
+def test_contended_mailbox_keeps_published_mail_readable(tmp_path, operation):
     item = _send(tmp_path)
     context = multiprocessing.get_context("spawn")
     ready, done, result = context.Event(), context.Event(), context.Queue()
@@ -141,9 +142,13 @@ def test_contended_mailbox_returns_for_retry_without_consuming_mail(tmp_path, op
         try:
             assert ready.wait(10), "mailbox worker did not start"
             assert done.wait(8), "mailbox operation blocked on a lock instead of returning for retry"
-            error, message = result.get(timeout=2)
-            assert error == "TimeoutError", (error, message)
-            assert "retry" in message.lower()
+            error, outcome = result.get(timeout=2)
+            if operation == "read":
+                assert error is None, (error, outcome)
+                assert outcome["messages"] == [item]
+            else:
+                assert error == "TimeoutError", (error, outcome)
+                assert "retry" in outcome.lower()
             process.join(timeout=5)
             assert process.exitcode == 0
         finally:
@@ -153,6 +158,23 @@ def test_contended_mailbox_returns_for_retry_without_consuming_mail(tmp_path, op
             result.close()
             result.join_thread()
     assert box.read_pending([tmp_path])["messages"] == [item]
+
+
+def test_concurrent_ack_is_not_reported_as_unreadable(tmp_path, monkeypatch):
+    first, second = _send(tmp_path, "first"), _send(tmp_path, "second")
+    load = box._load
+
+    def ack_before_open(path):
+        if path.stem == first["message_id"]:
+            assert box.acknowledge([tmp_path], [path.stem])["acknowledged"] == [path.stem]
+        return load(path)
+
+    monkeypatch.setattr(box, "_load", ack_before_open)
+    snapshot = box.read_pending([tmp_path])
+    assert snapshot["messages"] == [second]
+    assert snapshot["pending_count"] == 1
+    assert snapshot["unreadable_count"] == 0
+    assert (tmp_path / f"{second['message_id']}.json").exists()
 
 
 def test_invalid_unicode_is_rejected_before_inbox_creation(tmp_path):

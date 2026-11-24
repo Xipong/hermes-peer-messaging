@@ -4,13 +4,11 @@ from __future__ import annotations
 import json
 import time
 from contextlib import contextmanager
-from uuid import uuid4
 
 from hermes_cli.active_sessions import _FileLock
 from hermes_constants import get_hermes_home
 from persistence.conversation.messages import TranscriptRead
-from persistence.conversation.sessions import NewSession, SessionId, sanitize_title
-from persistence_assembly import open_persistence, open_persistence_reader, profile_scope
+from persistence_assembly import open_persistence_reader
 from utils import atomic_json_write
 
 from . import mailbox, service
@@ -23,13 +21,13 @@ _MAX_TEXT = 3000
 
 
 @contextmanager
-def graph(home, *, write=False):
+def graph(home, *, write=False, locked=False):
     folder = service.root(home)
     path = folder / ".threads.json"
     lock = folder / ".threads.lock"
     if path.is_symlink() or lock.is_symlink():
         raise ValueError("Thread link storage must not be a symlink")
-    if write:
+    if write or locked:
         folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     def load():
         try:
@@ -43,13 +41,19 @@ def graph(home, *, write=False):
         if not isinstance(value, dict) or value.get("version") != 1 or not isinstance(value.get("links"), dict):
             raise ValueError("Invalid thread link store")
         return value["links"]
-    if not write:
+    if not (write or locked):
         yield load()  # Atomic publication gives readers a complete old or new snapshot.
         return
-    with _FileLock(lock, timeout=2.0):
-        links = load()
-        yield links
-        atomic_json_write(path, {"version": 1, "links": links}, indent=None, mode=0o600)
+    try:
+        with _FileLock(lock, timeout=2.0):
+            links = load()
+            yield links
+            if write:
+                atomic_json_write(path, {"version": 1, "links": links}, indent=None, mode=0o600)
+    except RuntimeError as exc:
+        if isinstance(exc.__cause__, BlockingIOError):
+            raise TimeoutError("Peer links are busy; retry the operation") from exc
+        raise
 
 
 def locate(store, sid, *, allow_ended=False):
@@ -305,33 +309,6 @@ def wait_threads(args, sid):
         time.sleep(min(0.75, remaining))
 
 
-def create_thread(args, sid):
-    if args.get("confirm") is not True:
-        raise ValueError("Use confirm=true only when the user explicitly asked to create a new chat")
-    name = args.get("title")
-    if not isinstance(name, str) or not (title := sanitize_title(name)):
-        raise ValueError("A non-empty chat title is required")
-    home = get_hermes_home()
-    target = SessionId(f"thread-{uuid4().hex}")
-    with graph(home, write=True) as links, open_persistence(profile_scope(home=home)) as store:
-        own_id, own = locate(store, sid)
-        if not service.project(own) or not own.cwd:
-            raise ValueError("Set the current chat's project before creating another thread")
-        edge = new_edge(links, own_id, target)
-        # Do not copy messages, system prompt, runtime policy, secrets, or parent DB lineage.
-        # This creates a named local chat record only. A human may open it separately.
-        source = service.surface(own)
-        assert source is not None  # locate accepted only local surfaces.
-        store.sessions.create_exclusive(target, source=source, title=title)
-        store.sessions.create(NewSession(target, source, cwd=own.cwd, git_repo_root=own.git_repo_root))
-        row = store.sessions.get(target)
-        if not same_project(own, row):
-            raise ValueError("New linked chats must belong to the current chat's project")
-        edge.update(offers=sorted((own_id, target)), since=time.time())
-    return {"success": True, "status": "created_idle", **describe(target, row),
-            "note": "Created a new self-contained chat without starting a turn. Open it by title or session ID."}
-
-
 def register(ctx):
     def add(name, operation, description, properties, required=()):
         ctx.register_tool(name=name, toolset=service.TOOLSET, check_fn=service.requirements,
@@ -342,11 +319,9 @@ def register(ctx):
     add("list_threads", list_threads, "List your team's directly linked local parent chats and pending offers. Delegated agents inherit their root parent's directory. No wake.", {})
     add("link_thread", link, "For independent local parents in one profile: propose or revoke a link between teams. Both must offer; links are not transitive. Linked teams can message each other across projects. Only links formed in the same project can share new public parent text. No prompt is sent.",
         {"thread_id": id_field, "action": {"type": "string", "enum": ["offer", "unlink"]}}, ("thread_id",))
-    add("read_thread", read_thread, "For independent parents: read bounded public text after a shared-transcript link in the same project. Mail-only links do not grant access. Delegated agents use peer_receive. scan_limited_roles reports incomplete scans. No raw tool results, reasoning, or wake.",
+    add("read_thread", read_thread, "For independent parents: read bounded public text after a shared-transcript link in the same project. Mail-only links do not grant access. Delegated agents receive mail as peer_data with their tool results. scan_limited_roles reports incomplete scans. No raw tool results, reasoning, or wake.",
         {"thread_id": id_field, "limit": {"type": "integer", "minimum": 1, "maximum": 10}}, ("thread_id",))
-    add("wait_threads", wait_threads, "For independent parents: wait up to 30 seconds for a same-project parent's saved final newer than the cursor on a shared-transcript link. Use peer_receive(wait_seconds=...) for mail replies. scan_limit reports an incomplete search. Does not launch or resume anyone.",
+    add("wait_threads", wait_threads, "For independent parents: wait up to 30 seconds for a same-project parent's saved final newer than the cursor on a shared-transcript link. Mail replies arrive as peer_data with ordinary tool results; do not use this to poll the inbox or track child completion. scan_limit reports an incomplete search. Does not launch or resume anyone.",
         {"threads": {"type": "array", "minItems": 1, "maxItems": 5, "items": {"type": "object", "properties": {
             "thread_id": id_field, "after_row_id": {"type": "integer", "minimum": 0}}, "required": ["thread_id"], "additionalProperties": False}},
          "wait_seconds": {"type": "number", "minimum": 0, "maximum": 30}}, ("threads",))
-    add("create_thread", create_thread, "Only on an explicit user request: create a fresh independent named chat in this project and link it. No messages copied, no model called, no chat awakened.",
-        {"title": {"type": "string", "maxLength": 100}, "confirm": {"type": "boolean"}}, ("title", "confirm"))

@@ -1,7 +1,7 @@
 """File-mailbox operations for local peer sessions, not a turn scheduler.
 
-Reads are non-destructive. Only an explicit recipient acknowledgement consumes
-an envelope, so a failed tool result or process restart can retry the same ID.
+Reads are non-destructive. Only confirmed delivery or an explicit recipient
+acknowledgement consumes an envelope, so a failed result can retry the same ID.
 This is at-least-once reading, not exactly-once task execution.
 """
 from __future__ import annotations
@@ -30,10 +30,10 @@ MAX_ENVELOPE_BYTES = 64_000
 
 
 @contextmanager
-def _locked(inbox: Path):
-    # A stalled peer must not turn a bounded inbox poll into an indefinite wait.
+def _locked(inbox: Path, *, timeout=2.0):
+    # Automatic receipts try once; explicit mutations retain a bounded wait.
     try:
-        with _FileLock(inbox / ".lock", timeout=2.0):
+        with _FileLock(inbox / ".lock", timeout=timeout):
             yield
     except RuntimeError as exc:
         if isinstance(exc.__cause__, BlockingIOError):
@@ -136,7 +136,11 @@ def pending_ids(inboxes: list[Path]) -> frozenset[str]:
 
 
 def read_pending(inboxes: list[Path], *, limit: int = MAX_READ_MESSAGES) -> dict[str, Any]:
-    """A bounded non-destructive read. I/O failures remain retryable, not acknowledged."""
+    """Read an inbox snapshot without waiting for a sender or ACK's write lock.
+
+    Envelopes are immutable and published by atomic rename, so readers see a
+    complete file or no file. A concurrent ACK can remove a snapshot entry.
+    """
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_READ_MESSAGES:
         raise ValueError(f"limit must be between 1 and {MAX_READ_MESSAGES}")
     entries, unreadable = [], 0
@@ -145,24 +149,26 @@ def read_pending(inboxes: list[Path], *, limit: int = MAX_READ_MESSAGES) -> dict
             continue
         if inbox.is_symlink():
             raise ValueError("Peer inbox must not be a symlink")
-        with _locked(inbox):
-            for path in _paths(inbox):
-                try:
-                    entry = _load(path)
-                    if entry is None:
-                        # Only demonstrated invalidity permits poison-file removal.
-                        path.unlink(missing_ok=True)
-                    else:
-                        entries.append(entry)
-                except (OSError, ValueError):
-                    unreadable += 1
-                    logger.debug("peer inbox: cannot read %s", path.name, exc_info=True)
+        for path in _paths(inbox):
+            try:
+                entry = _load(path)
+                if entry is None:
+                    # Only demonstrated invalidity permits poison-file removal.
+                    path.unlink(missing_ok=True)
+                else:
+                    entries.append(entry)
+            except FileNotFoundError:
+                # A concurrent explicit ACK is not a failed read to retry.
+                continue
+            except (OSError, ValueError):
+                unreadable += 1
+                logger.debug("peer inbox: cannot read %s", path.name, exc_info=True)
     entries.sort(key=lambda e: e["message_id"])
     return {"messages": entries[:limit], "has_more": len(entries) > limit,
             "pending_count": len(entries), "unreadable_count": unreadable}
 
 
-def acknowledge(inboxes: list[Path], ids: list[str]) -> dict[str, Any]:
+def acknowledge(inboxes: list[Path], ids: list[str], *, lock_timeout=2.0) -> dict[str, Any]:
     """Only the caller's inboxes are supplied. Repeated ACKs never consume a neighbor."""
     if not isinstance(ids, list) or not ids or len(ids) > MAX_PENDING_MESSAGES:
         raise ValueError(f"message_ids must contain 1–{MAX_PENDING_MESSAGES} IDs")
@@ -173,7 +179,7 @@ def acknowledge(inboxes: list[Path], ids: list[str]) -> dict[str, Any]:
             continue
         if inbox.is_symlink():
             raise ValueError("Peer inbox must not be a symlink")
-        with _locked(inbox):
+        with _locked(inbox, timeout=lock_timeout):
             for key in wanted:
                 path = inbox / f"{key}.json"
                 try:

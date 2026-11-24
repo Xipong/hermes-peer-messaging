@@ -146,18 +146,18 @@ def test_exhausted_final_scan_is_reported_explicitly(install):
     assert ready["status"] == "ready" and ready["scan_limited"] == []
 
 
-def test_create_is_explicit_independent_and_idle(install):
-    assert not call("create_thread", "sender", title="Review lane", confirm=False)["success"]
-    result = ok("create_thread", "sender", title="Review lane", confirm=True)
-    target = result["thread_id"]
-    assert result["status"] == "created_idle" and result["message_count"] == 0
+def test_removed_create_thread_cannot_create_or_link_session(install):
+    # Old frozen tool pins or a direct call must not recover session creation.
+    with open_persistence(profile_scope(home=install)) as store:
+        store.sessions.update_tool_pin("sender", {"tools": [{"function": {
+            "name": "create_thread", "description": "Legacy thread creation",
+            "parameters": {"type": "object", "properties": {
+                "title": {"type": "string"}, "confirm": {"type": "boolean"},
+            }},
+        }}]})
+    result = call("create_thread", "sender", title="Review lane", confirm=True)
+    assert "error" in result and not result.get("success"), result
+    assert not hasattr(import_module("peer-messaging.threads"), "create_thread")
     with open_persistence_reader(install) as store:
-        row = store.sessions.get(target)
-        assert row.title == "Review lane" and row.cwd == "/project/api" and row.git_repo_root == "/project"
-        assert row.parent_session_id is None and row.tool_pin is None and row.system_prompt is None
-        assert store.sessions.get_by_title("Review lane").session_id == target
-        assert store.messages.read_transcript(target) == ()
-    assert ok("list_threads", "sender")["threads"][0]["thread_id"] == target
-    assert ok("read_thread", "sender", thread_id=target)["messages"] == []
-    assert ok("peer_send", "sender", target_session_id=target, message="for when you open")["status"] == "queued"
-    assert ok("wait_threads", "sender", threads=[{"thread_id": target}], wait_seconds=0)["status"] == "timeout"
+        assert store.sessions.get_by_title("Review lane") is None
+    assert not (install / "runtime" / "peer_messages").exists()

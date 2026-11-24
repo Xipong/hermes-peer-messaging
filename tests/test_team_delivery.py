@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+from importlib import import_module
 from pathlib import Path
 
 import pytest
@@ -111,6 +112,30 @@ def test_same_team_cross_batch_and_nested_messages_keep_separate_inboxes(teams):
     assert ok("peer_receive", "b2")["messages"][0]["message_id"] == cross["message_id"]
 
 
+def test_parent_alias_targets_immediate_parent_through_compaction(teams):
+    with open_persistence(profile_scope(home=teams)) as store:
+        add_child(store, "nested", "a1")
+        for old, current, parent in (("nested", "nested-tip", "a1"), ("a1", "a1-tip", "sender")):
+            store.sessions.end(old, "compression")
+            store.sessions.create(NewSession(
+                current, "subagent", parent_session_id=old,
+                model_config={"_delegate_from": parent, "_subagent_id": "task-" + old},
+            ))
+        store.sessions.end("sender", "compression")
+        store.sessions.create(NewSession("sender-tip", "cli", parent_session_id="sender"))
+
+    sent = ok("peer_send", "nested-tip", target_session_id="parent", message="For my immediate parent")
+    assert sent["requested_target_session_id"] == "parent"
+    assert sent["target_session_id"] == "a1-tip"
+    assert ok("peer_receive", "a1-tip")["messages"][0]["message_id"] == sent["message_id"]
+    assert ok("peer_receive", "sender-tip")["messages"] == []
+    reported = ok("peer_send", "a1-tip", target_session_id="parent", message="For the root")
+    assert reported["target_session_id"] == "sender-tip"
+    assert ok("peer_receive", "sender-tip")["messages"][0]["message_id"] == reported["message_id"]
+    refused = call("peer_send", "sender-tip", target_session_id="parent", message="No parent exists")
+    assert refused["success"] is False and "no delegation parent" in refused["error"]
+
+
 def test_cross_project_parent_consent_enables_only_peer_mail(install):
     from test_awareness import pin, start
     from test_hermes_projects import project
@@ -165,7 +190,9 @@ def test_pathless_team_discovers_other_batches_and_parent_without_project(instal
     assert found["batch-two"]["root_thread_id"] == "root"
     sent = ok("peer_send", "batch-one", target_session_id=found["batch-two"]["session_id"], message="Across calls")
     notice = tool("batch-two", "child-turn")
-    assert "_peer_inbox_notice" in notice and "Across calls" not in json.dumps(notice)
+    assert "_peer_inbox_notice" not in notice
+    assert notice["peer_data"]["messages"][0]["message_id"] == sent["message_id"]
+    assert notice["peer_data"]["messages"][0]["message"] == "Across calls"
     received = ok("peer_receive", "batch-two")
     assert received["authority"] == "peer_data"
     assert received["messages"][0]["message_id"] == sent["message_id"]
@@ -183,6 +210,32 @@ def test_unlink_revokes_child_access_without_destroying_already_queued_mail(team
     assert ok("peer_receive", "b1")["messages"][0]["message_id"] == accepted["message_id"]
     assert ok("peer_receive", "b1", action="ack", message_ids=[accepted["message_id"]])["acknowledged"] == [accepted["message_id"]]
     assert ok("peer_send", "a1", target_session_id="a2", message="Own team still reachable")["status"] == "queued"
+
+
+def test_cross_team_send_holds_consent_until_publication(teams, monkeypatch):
+    link_roots()
+    service = import_module("peer-messaging.service")
+    mailbox = import_module("peer-messaging.mailbox")
+    enqueue = mailbox.enqueue
+    graph = teams / "runtime" / "peer_messages" / ".threads.json"
+    before, modified = graph.read_bytes(), graph.stat().st_mtime_ns
+    attempted = []
+
+    def revoke_before_publication(*args, **kwargs):
+        # A sender paused after admission must not publish behind a successful
+        # unlink. Competing revocation times out retryably on the real file lock.
+        attempted.append(call("link_thread", "recipient", thread_id="sender", action="unlink"))
+        return enqueue(*args, **kwargs)
+
+    monkeypatch.setattr(mailbox, "enqueue", revoke_before_publication)
+    sent = service.send({"target_session_id": "b1", "message": "Admitted before revocation"}, "a1")
+    assert len(attempted) == 1 and attempted[0]["success"] is False
+    assert attempted[0]["retryable"] is True
+    # Locking a graph snapshot for sending does not republish link state.
+    assert graph.read_bytes() == before and graph.stat().st_mtime_ns == modified
+    assert ok("link_thread", "recipient", thread_id="sender", action="unlink")["status"] == "unlinked"
+    assert not call("peer_send", "a1", target_session_id="b1", message="After revocation")["success"]
+    assert ok("peer_receive", "b1")["messages"][0]["message_id"] == sent["message_id"]
 
 
 def test_gateway_foreign_or_unattributed_children_cannot_route_as_local_teams(teams):
