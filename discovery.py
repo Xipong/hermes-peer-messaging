@@ -7,6 +7,10 @@ from dataclasses import dataclass
 
 from persistence.conversation.sessions import SessionOrder, SessionQuery, SessionWindow
 
+from . import teams
+
+ROOT_SCAN_LIMIT = 100
+
 
 @dataclass(frozen=True)
 class CandidateSnapshot:
@@ -16,16 +20,14 @@ class CandidateSnapshot:
 
 
 def scan(store, live_owners=None):
-    from . import service
-
     rows = store.sessions.list_sessions(
-        SessionQuery(sources=tuple(sorted(service.STORED)), local_created_sources=tuple(sorted(service.LOCAL)),
+        SessionQuery(sources=tuple(sorted(teams.STORED)), local_created_sources=tuple(sorted(teams.LOCAL)),
                      include_children=True, include_subagents=False,
                      order=SessionOrder.LAST_ACTIVE, project_compression_tips=False),
-        SessionWindow(limit=service.SCAN_LIMIT), compact_rows=True,
+        SessionWindow(limit=ROOT_SCAN_LIMIT), compact_rows=True,
     )
     return CandidateSnapshot(tuple((entry.session.session_id, entry.last_active) for entry in rows),
-                             ("local",) if len(rows) >= service.SCAN_LIMIT else (),
+                             ("local",) if len(rows) >= ROOT_SCAN_LIMIT else (),
                              None if live_owners is None else frozenset(live_owners))
 
 
@@ -35,8 +37,6 @@ def family_candidates(store, own):
     The marker lookup is only a candidate index. The caller still resolves
     every returned identity and verifies its delegation/compression edge.
     """
-    from . import teams
-
     parents = [own]
     if own.is_child:
         try:

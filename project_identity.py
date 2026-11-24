@@ -57,7 +57,7 @@ class ProjectIndex:
             LOG.debug("Native Hermes Projects unavailable; using stored workspace identity", exc_info=True)
 
     def key(self, row):
-        """Stable key with explicit Project ID before legacy path fallback."""
+        """Stable key with explicit Project ID before workspace-path fallback."""
         cwd = _path(getattr(row, "cwd", None))
         root = _path(getattr(row, "git_repo_root", None))
         best, selected = None, None

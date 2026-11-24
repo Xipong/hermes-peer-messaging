@@ -41,6 +41,13 @@ def _locked(inbox: Path, *, timeout=2.0):
         raise
 
 
+def root(home):
+    inbox = home / "runtime" / "peer_messages_v2"
+    if inbox.is_symlink() or inbox.parent.is_symlink():
+        raise ValueError("Peer mailbox directory must not be a symlink")
+    return inbox
+
+
 def session_component(value: str) -> str:
     """Reject, rather than sanitize, IDs: no traversal or many-to-one aliases."""
     if not isinstance(value, str) or _SESSION_ID.fullmatch(value) is None:

@@ -72,8 +72,6 @@ def sweep(home, live_owners):
     segments are never retired. Reopened participants can read archived mail.
     No worker, timer, model request, or deletion of unacknowledged mail.
     """
-    from .service import root
-
     if live_owners is None:
         return
     key = str(home)
@@ -87,7 +85,7 @@ def sweep(home, live_owners):
         while len(_sweeps) > 16:
             _sweeps.popitem(last=False)
     try:
-        folder = root(home)
+        folder = mailbox.root(home)
         if not folder.is_dir():
             return
         names = sorted(p.name for p in folder.iterdir() if not p.name.startswith(".") and p.is_dir()
