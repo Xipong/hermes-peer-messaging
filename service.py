@@ -355,10 +355,10 @@ def register(ctx):
                           check_fn=requirements, description="Local peer messaging", emoji=emoji)
 
     tool("peer_sessions", sessions,
-         "Find your parent, direct children, same-parent siblings, or other roots if you are a root. "
+         "Find your immediate parent, direct children, same-parent siblings, or other roots if you are a root. "
          "Use for unknown addresses or peer_update.has_more.", {
              "scope": {"type": "string", "enum": ["roots", "team", "all"], "default": "all",
-                       "description": "roots: permitted roots; team: immediate family; all: both."},
+                       "description": "roots: independent chats; team: immediate family; all: both."},
              "active_within_minutes": {"type": "integer", "minimum": 1, "maximum": 1440, "default": 60,
                                        "description": "Recency in minutes; immediate parent and live owners are exempt."},
              "same_project": {"type": "boolean", "default": True,
@@ -366,18 +366,18 @@ def register(ctx):
          })
     tool("peer_send", send,
          "Queue coordination mail. Raise cross-branch issues via your parent; delegate_task returns final summaries. "
-         "Queued is not read or a wake. Recipient state is advisory; continue work without polling.", {
+         "Queued means stored, not read; recipients are not woken. recipient_state is advisory. Continue work without polling.", {
              "target_session_id": {"type": "string", "description": "Known session_id/thread_id or parent (immediate parent)."},
              "message": {"type": "string", "minLength": 1, "maxLength": mailbox.MAX_MESSAGE_CHARS},
              "in_reply_to": {"type": "string", "description": "ID of the message being answered."},
          }, ("target_session_id", "message"), "📨")
     tool("peer_receive", receive,
-         "Read mail only when needed now; normally it arrives with tool results and is confirmed automatically.", {
+         "Read mail if needed now, or ACK fully read duplicates. Normally delivery and ACK are automatic.", {
              "action": {"type": "string", "enum": ["read", "ack"], "default": "read"},
              "limit": {"type": "integer", "minimum": 1, "maximum": mailbox.MAX_READ_MESSAGES, "default": 5,
                        "description": "Read only."},
              "message_ids": {"type": "array", "minItems": 1, "maxItems": mailbox.MAX_PENDING_MESSAGES,
-                             "items": {"type": "string"}, "description": "ACK only: IDs of repeated messages already read in full."},
+                             "items": {"type": "string"}, "description": "ACK only: message IDs."},
          }, emoji="📥")
     delivery = InboxDelivery()
     notices = InboxNotices(delivery)
