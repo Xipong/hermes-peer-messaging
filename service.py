@@ -365,7 +365,9 @@ def register(ctx):
                               "description": "Filter other roots by project only."},
          })
     tool("peer_send", send,
-         "Queue coordination mail. Raise cross-branch issues via your parent; delegate_task returns final summaries. "
+         "Send a decision, blocker, or handoff; combine routine progress into one update per recipient at a checkpoint. "
+         "If a delay would block someone, send now. Otherwise, include the send in the same batch as your next independent work tool when possible. "
+         "Raise cross-branch issues via your parent; delegate_task returns final summaries. "
          "Queued means stored, not read; recipients are not woken. recipient_state is advisory. Continue work without polling.", {
              "target_session_id": {"type": "string", "description": "Known session_id/thread_id or parent (immediate parent)."},
              "message": {"type": "string", "minLength": 1, "maxLength": mailbox.MAX_MESSAGE_CHARS},
