@@ -154,7 +154,8 @@ def enqueue(inbox: Path, *, sender: str, target: str, text: str,
         if len(_paths(inbox)) >= MAX_PENDING_MESSAGES:
             raise ValueError("Target inbox is full; its recipient must read and acknowledge messages")
         key = f"{time.time_ns():020d}_{uuid.uuid4().hex[:8]}"
-        while (inbox / f"{key}.json").exists():
+        archived = _archive_dir(inbox)
+        while (inbox / f"{key}.json").exists() or (archived / f"{key}.json").exists():
             key = f"{time.time_ns():020d}_{uuid.uuid4().hex[:8]}"
         entry = {"message_id": key, "from_session_id": sender, "target_session_id": target,
                  "message": text.strip(), "sent_at": time.time(), "in_reply_to": in_reply_to}
@@ -212,6 +213,10 @@ def acknowledge(inbox: Path, ids: list[str], *, lock_timeout=2.0) -> dict[str, A
     if inbox.is_symlink():
         raise ValueError("Peer inbox must not be a symlink")
     archived = _archive_dir(inbox)
+    if archived.is_dir() and not inbox.exists():
+        # A user may remove an empty active directory after archival. Recreate
+        # only the lock's directory, not any acknowledged envelope.
+        inbox.mkdir(mode=0o700, parents=True, exist_ok=True)
     if inbox.is_dir():
         with _locked(inbox, timeout=lock_timeout):
             for key in wanted:

@@ -223,6 +223,7 @@ def test_legacy_contact_graph_is_ignored_and_untouched(teams):
     folder.mkdir(parents=True, exist_ok=True)
     graph = folder / ".threads.json"
     graph.write_text('{"version":2,"links":{"recipient:sender":["recipient","sender"]}}')
+    (folder / ".threads.lock").touch()
     before, modified = graph.read_bytes(), graph.stat().st_mtime_ns
     entries = set(folder.iterdir())
     with ThreadPoolExecutor(max_workers=1) as executor:
