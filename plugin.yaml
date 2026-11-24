@@ -13,7 +13,6 @@ provides_tools:
   - link_thread
   - read_thread
   - wait_threads
-  - create_thread
 provides_hooks:
   - pre_llm_call
   - transform_tool_result
