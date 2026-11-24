@@ -2,9 +2,9 @@
 
 
 def register(ctx):
-    from . import service, threads
+    from . import service
 
     service.register(ctx)
-    threads.register(ctx)
+
 
 __all__ = ["register"]

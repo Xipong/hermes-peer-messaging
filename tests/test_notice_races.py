@@ -34,7 +34,7 @@ def test_mail_arriving_after_read_is_not_marked_as_already_inspected(install):
     # This models the dispatcher finishing the read before its transform hook runs.
     late = call("peer_send", "sender", target_session_id="recipient", message="late private note")
     carried = json.loads(finish(notices, "peer_receive", read))
-    assert "peer_receive" in carried["_peer_inbox_notice"]
+    assert carried["peer_update"]["mail_pending"] is True
     assert carried["messages"] == read["messages"]
     assert "late private note" not in json.dumps(carried)
     assert finish(notices, "other_tool", {"value": 1}) is None
@@ -55,7 +55,7 @@ def test_mail_arriving_after_ack_still_announces_itself_in_the_same_turn(install
 
     late = call("peer_send", "sender", target_session_id="recipient", message="arrived after ACK")
     carried = json.loads(finish(notices, "peer_receive", acknowledged, args))
-    assert "peer_receive" in carried["_peer_inbox_notice"]
+    assert carried["peer_update"]["mail_pending"] is True
     assert carried["acknowledged"] == [first["message_id"]]
     assert "arrived after ACK" not in json.dumps(carried)
     assert finish(notices, "other_tool", {"value": 1}) is None
@@ -64,23 +64,23 @@ def test_mail_arriving_after_ack_still_announces_itself_in_the_same_turn(install
         assert store.sessions.get("recipient").message_count == 0
 
 
-def test_offer_arriving_after_list_threads_is_not_suppressed(install):
+def test_offer_arriving_after_directory_is_not_suppressed(install):
     threads = import_module("peer-messaging.threads")
-    notices = tracker(install, "list_threads", "link_thread")
-    listed = threads.list_threads({}, "recipient")
-    assert listed["threads"] == []
+    service = import_module("peer-messaging.service")
+    notices = tracker(install, "peer_sessions", "link_thread")
+    listed = service.sessions({}, "recipient")
+    assert listed["links"] == []
     assert threads.link({"thread_id": "recipient"}, "sender")["status"] == "awaiting_other_chat"
 
-    carried = json.loads(finish(notices, "list_threads", listed))
-    assert "list_threads" in carried["_peer_link_notice"]
-    assert carried["threads"] == []
-    assert "sender" not in json.dumps(carried)
+    carried = json.loads(finish(notices, "peer_sessions", listed))
+    assert carried["peer_update"]["incoming_links"] == ["sender"]
+    assert carried["links"] == []
     assert finish(notices, "other_tool", {"value": 1}) is None
-    assert [(item["thread_id"], item["link"]) for item in threads.list_threads({}, "recipient")["threads"]] == [
+    assert [(item["thread_id"], item["link"]) for item in service.sessions({}, "recipient")["links"]] == [
         ("sender", "incoming"),
     ]
     with threads.graph(install) as links:
-        assert links[threads.pair("sender", "recipient")]["since"] is None
+        assert links[threads.pair("sender", "recipient")] == ["sender"]
 
 
 def test_peer_arriving_after_discovery_is_not_treated_as_a_returned_address(install, monkeypatch):
@@ -99,7 +99,6 @@ def test_peer_arriving_after_discovery_is_not_treated_as_a_returned_address(inst
     assert finish(notices, "other_tool", {"value": 1}) is None
     clock[0] += service.DISCOVERY_INTERVAL
     carried = json.loads(finish(notices, "other_tool", {"value": 2}))
-    assert "peer_sessions" in carried["_peer_discovery_notice"]
-    assert "late-peer" in {peer["session_id"] for peer in carried["_peer_roster"]["peers"]}
+    assert carried["peer_update"]["neighbors"] == ["late-peer"]
     assert finish(notices, "other_tool", {"value": 3}) is None
     assert {item["session_id"] for item in service.sessions({}, "recipient")["peers"]} == {"sender", "late-peer"}

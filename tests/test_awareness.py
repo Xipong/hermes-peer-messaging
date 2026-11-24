@@ -1,4 +1,4 @@
-"""Proactive local discovery and incoming-link awareness through native hooks."""
+"""Root-only automatic discovery, explicit scopes and bounded notifications."""
 import json
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
@@ -13,7 +13,7 @@ from persistence_assembly import open_persistence, open_persistence_reader, prof
 from test_local_delivery import call, install  # noqa: F401 -- native temporary profile
 
 
-def pin(home, sid, names=("peer_sessions", "peer_receive", "list_threads", "link_thread")):
+def pin(home, sid, names=("peer_sessions", "peer_receive", "link_thread")):
     with open_persistence(profile_scope(home=home)) as store:
         store.sessions.update_tool_pin(sid, {"tools": [{"function": {"name": name}} for name in names]})
 
@@ -27,7 +27,7 @@ def start(sid, turn, *, platform="desktop", parent=""):
                         if isinstance(value, dict) and value.get("context"))
 
 
-def tool(sid, turn, name="list_threads", **args):
+def tool(sid, turn, name="peer_receive", **args):
     from model_tools import handle_function_call
 
     return json.loads(handle_function_call(name, args, session_id=sid, turn_id=turn,
@@ -41,86 +41,91 @@ def assert_no_model_work(home, *ids):
             assert row.message_count == row.api_call_count == 0
 
 
-def test_fresh_chat_discovers_peers_before_first_contact_without_writes(install):
+def work(notices, sid="recipient", turn="active-turn", result='{"ok":true}'):
+    changed = notices.after_tool(tool_name="work", result=result, session_id=sid, turn_id=turn)
+    return json.loads(changed)["peer_update"] if changed is not None else None
+
+
+def test_fresh_chat_discovers_root_once_without_peer_text_or_writes(install):
     service = import_module("peer-messaging.service")
     pin(install, "recipient")
     pin(install, "elsewhere")
     with open_persistence(profile_scope(home=install)) as store:
         store.sessions.set_title("sender", "peer-controlled-title")
-    folder = install / "runtime" / "peer_messages"
-    assert not folder.exists()
-
-    context = start("recipient", "fresh-turn")
-    assert context == service.DISCOVERY_HINT
-    assert "peer-controlled-title" not in context
-    # No same-project peer exists for this other project; configured foreign and
-    # managed rows also cannot make the current project's discovery eligible.
-    assert start("elsewhere", "other-project-turn", platform="tui") == ""
-    assert tool("recipient", "fresh-turn")["threads"] == []
-    assert "_peer_discovery_notice" not in tool("recipient", "fresh-turn")
-    discovered = tool("recipient", "fresh-turn", "peer_sessions")
-    assert [peer["session_id"] for peer in discovered["peers"]] == ["sender"]
-    assert discovered["peers"][0]["title"] == "peer-controlled-title"
-    assert "_peer_discovery_notice" not in discovered
-    assert not folder.exists()
+    notices = service.InboxNotices()
+    assert not (install / "runtime" / "peer_messages_v2").exists()
+    assert start("recipient", "fresh-turn") == ""
+    update = work(notices)
+    assert update == {"authority": "peer_data", "neighbors": ["sender"]}
+    assert work(notices) is None
+    assert work(notices, turn="next-turn") is None
+    assert work(notices, sid="elsewhere") is None
+    listed = call("peer_sessions", "recipient", scope="roots")
+    assert [peer["session_id"] for peer in listed["peers"]] == ["sender"]
+    assert listed["peers"][0]["title"] == "peer-controlled-title"
+    assert not (install / "runtime" / "peer_messages_v2").exists()
     assert_no_model_work(install, "sender", "recipient", "elsewhere", "managed", "foreign")
 
 
-def test_incoming_offer_notifies_active_and_next_turn_but_only_parent_accepts(install):
+def test_twenty_foreign_workers_across_eight_calls_never_update_root_or_child(install, monkeypatch):
+    from test_team_delivery import add_child, link_roots, peers
     service = import_module("peer-messaging.service")
     with open_persistence(profile_scope(home=install)) as store:
-        store.sessions.create(NewSession("child", "subagent", parent_session_id="recipient",
-                                         model_config={"_delegate_from": "recipient", "_subagent_id": "task-child"}))
-    pin(install, "recipient")
-    pin(install, "child")
-    assert service.LINK_HINT not in start("recipient", "running-turn")
-    assert call("link_thread", "sender", thread_id="recipient")["status"] == "awaiting_other_chat"
-    graph = install / "runtime" / "peer_messages" / ".threads.json"
-    offered = graph.read_bytes()
+        add_child(store, "coordinator-a", "recipient")
+        add_child(store, "coordinator-b", "sender")
+    for sid in ("recipient", "coordinator-a"):
+        pin(install, sid)
+    link_roots()
+    clock = [100.0]
+    monkeypatch.setattr(service, "time", SimpleNamespace(monotonic=lambda: clock[0], time=service.time.time))
+    notices = service.InboxNotices()
+    assert work(notices)["neighbors"] == ["sender"]
+    assert work(notices, "coordinator-a") == {"authority": "peer_data", "parent": "recipient", "root": "recipient"}
+    index = 0
+    for batch in range(8):
+        with open_persistence(profile_scope(home=install)) as store:
+            for _ in range(3 if batch < 4 else 2):
+                add_child(store, f"foreign-{index}", "sender")
+                index += 1
+            if batch:
+                store.sessions.end(f"foreign-{batch - 1}", "agent_close")
+        clock[0] += service.DISCOVERY_INTERVAL + 1
+        assert work(notices) is None
+        assert work(notices, "coordinator-a") is None
+    assert index == 20
+    assert work(notices, turn="another-turn") is None
+    assert "foreign-19" in peers("coordinator-a", scope="all")
+    assert set(peers("coordinator-a", scope="team")) == {"recipient"}
+    assert set(peers("coordinator-a", scope="roots")) == {"recipient", "sender"}
+    sent = call("peer_send", "coordinator-b", target_session_id="coordinator-a", message="Coordinate parser changes")
+    assert sent["status"] == "queued"
+    delivery = import_module("peer-messaging.delivery").InboxDelivery()
+    receiver = service.InboxNotices(delivery)
+    carried = json.loads(receiver.after_tool(tool_name="work", result='{"ok":true}', session_id="coordinator-a",
+                                              turn_id="mail-turn", tool_call_id="receive-coordination"))
+    assert carried["peer_data"]["messages"][0]["message_id"] == sent["message_id"]
+    assert "neighbors" not in carried.get("peer_update", {})
+    reported = call("peer_send", "coordinator-a", target_session_id="parent", message="Agreed with other coordinator")
+    assert reported["target_session_id"] == "recipient"
+    assert call("peer_receive", "recipient")["messages"][0]["message_id"] == reported["message_id"]
 
-    # An unrelated inbox inspection can carry the new offer without executing it.
-    noticed = tool("recipient", "running-turn", "peer_receive")
-    assert noticed["messages"] == []
-    assert noticed["_peer_link_notice"] == service.LINK_HINT
-    assert "_peer_link_notice" not in tool("recipient", "running-turn", "peer_receive")
-    assert service.LINK_HINT in start("recipient", "next-turn")
-    assert service.LINK_HINT not in start("child", "child-turn", platform="subagent", parent="recipient")
-    assert [peer["session_id"] for peer in call("peer_sessions", "child")["peers"]] == ["recipient"]
-    assert not call("link_thread", "child", thread_id="sender")["success"]
-    assert graph.read_bytes() == offered
-    assert not (graph.parent / "recipient").exists()
-    assert_no_model_work(install, "sender", "recipient", "child")
 
-    incoming = tool("recipient", "next-turn", "list_threads")
-    assert "_peer_link_notice" not in incoming
-    assert incoming["threads"][0]["link"] == "incoming"
-    target = incoming["threads"][0]["thread_id"]
-    assert call("link_thread", "recipient", thread_id=target)["status"] == "linked"
-    assert {peer["session_id"] for peer in call("peer_sessions", "child")["peers"]} == {"recipient", "sender"}
-
-
-def test_cross_hook_dedup_does_not_hide_mail_arriving_later_in_same_turn(install):
+def test_incoming_offer_is_addressed_once_even_outside_project(install):
     service = import_module("peer-messaging.service")
-    pin(install, "recipient")
-    first = call("peer_send", "sender", target_session_id="recipient", message="private-first-note")
-    context = start("recipient", "one-turn")
-    assert service.HINT in context and service.DISCOVERY_HINT in context
-    assert "private-first-note" not in context
-    after_entry = tool("recipient", "one-turn")
-    assert "_peer_inbox_notice" not in after_entry and "_peer_discovery_notice" not in after_entry
-
-    second = call("peer_send", "sender", target_session_id="recipient", message="private-second-note")
-    later = tool("recipient", "one-turn")
-    assert later["_peer_inbox_notice"] == service.HINT
-    assert "private-second-note" not in json.dumps(later)
-    assert "_peer_inbox_notice" not in tool("recipient", "one-turn")
-    pending = call("peer_receive", "recipient")
-    assert [message["message_id"] for message in pending["messages"]] == [first["message_id"], second["message_id"]]
-    assert service.HINT in start("recipient", "another-turn")
-    assert_no_model_work(install, "sender", "recipient")
+    pin(install, "elsewhere")
+    notices = service.InboxNotices()
+    assert work(notices, "elsewhere") is None
+    assert call("link_thread", "sender", thread_id="elsewhere")["status"] == "awaiting_other_chat"
+    update = work(notices, "elsewhere")
+    assert update == {"authority": "peer_data", "incoming_links": ["sender"]}
+    assert work(notices, "elsewhere", "another-turn") is None
+    incoming = call("peer_sessions", "elsewhere", scope="team")
+    assert incoming["peers"] == []
+    assert incoming["links"][0]["link"] == "incoming"
+    assert call("link_thread", "elsewhere", thread_id="sender")["status"] == "linked"
 
 
-def test_discovery_waits_for_a_supported_carrier_and_rate_limits_scans(install, monkeypatch):
+def test_discovery_rate_limit_and_supported_carrier(install, monkeypatch):
     service = import_module("peer-messaging.service")
     pin(install, "recipient", ("peer_sessions",))
     clock, scans = [100.0], []
@@ -128,48 +133,84 @@ def test_discovery_waits_for_a_supported_carrier_and_rate_limits_scans(install, 
     monkeypatch.setattr(service, "time", SimpleNamespace(monotonic=lambda: clock[0], time=real_time.time))
 
     def counted(*args, **kwargs):
-        scans.append(clock[0])
+        scans.append((clock[0], kwargs["scope"]))
         return discover(*args, **kwargs)
 
     monkeypatch.setattr(service, "discover", counted)
     notices = service.InboxNotices()
-    identity = {"tool_name": "some_tool", "session_id": "recipient", "turn_id": "one-turn"}
+    identity = {"tool_name": "work", "session_id": "recipient", "turn_id": "one-turn"}
     assert notices.after_tool(result="[]", **identity) is None
     assert notices.after_tool(result='"scalar"', **identity) is None
     assert scans == []
-    first = json.loads(notices.after_tool(result='{"result": 1}', **identity))
-    assert first["result"] == 1 and first["_peer_discovery_notice"] == service.DISCOVERY_HINT
-    assert scans == [100.0]
-
+    assert work(notices)["neighbors"] == ["sender"]
+    assert scans == [(100.0, "roots")]
     with open_persistence(profile_scope(home=install)) as store:
         store.sessions.create(NewSession("new-peer", "cli", cwd="/project/new", git_repo_root="/project"))
     clock[0] = 104.0
-    assert notices.after_tool(result='{"result": 2}', **identity) is None
-    assert scans == [100.0]
+    assert work(notices) is None
     clock[0] = 106.0
-    assert "_peer_discovery_notice" in json.loads(notices.after_tool(result='{"result": 3}', **identity))
-    assert scans == [100.0, 106.0]
+    assert work(notices)["neighbors"] == ["new-peer"]
+    assert work(notices, turn="next-turn") is None
     clock[0] = 112.0
-    assert notices.after_tool(result='{"result": 4}', **identity) is None
-    assert scans == [100.0, 106.0, 112.0]
-    assert not (install / "runtime" / "peer_messages").exists()
+    assert work(notices) is None
+    assert scans == [(100.0, "roots"), (106.0, "roots"), (112.0, "roots")]
 
 
-def test_unrelated_subagents_do_not_crowd_local_parent_discovery(install):
+def test_compaction_of_either_root_does_not_repeat_neighbor_notice(install, monkeypatch):
     service = import_module("peer-messaging.service")
+    pin(install, "recipient", ("peer_sessions",))
+    clock = [100.0]
+    monkeypatch.setattr(service, "time", SimpleNamespace(monotonic=lambda: clock[0], time=service.time.time))
+    notices = service.InboxNotices()
+    assert work(notices)["neighbors"] == ["sender"]
+    with open_persistence(profile_scope(home=install)) as store:
+        for old, tip in (("sender", "sender-tip"), ("recipient", "recipient-tip")):
+            store.sessions.end(old, "compression")
+            store.sessions.create(NewSession(tip, "desktop", parent_session_id=old, cwd="/project/ui", git_repo_root="/project"))
+    pin(install, "recipient-tip", ("peer_sessions",))
+    clock[0] += service.DISCOVERY_INTERVAL + 1
+    assert work(notices, "recipient-tip", "new-turn") is None
+    assert call("peer_sessions", "recipient-tip", scope="roots")["peers"][0]["thread_id"] == "sender"
+    assert call("peer_send", "recipient-tip", target_session_id="sender", message="Stable address")["target_session_id"] == "sender-tip"
+
+
+def test_root_only_scan_is_shared_and_child_awareness_does_not_scan(install, monkeypatch):
+    service = import_module("peer-messaging.service")
+    from test_team_delivery import add_child
+
     with open_persistence(profile_scope(home=install)) as store:
         for index in range(105):
-            sid = f"unrelated-{index}"
-            store.sessions.create(NewSession(sid, "subagent", parent_session_id="elsewhere",
-                                             model_config={"_delegate_from": "elsewhere", "_subagent_id": sid}))
-    pin(install, "recipient", ("peer_sessions",))
-    assert start("recipient", "busy-profile-turn") == service.DISCOVERY_HINT
-    discovered = call("peer_sessions", "recipient")
-    assert [peer["session_id"] for peer in discovered["peers"]] == ["sender"]
-    assert discovered["scan_may_be_truncated"]
-    assert "subagent" in discovered["scan_limited_sources"]
-    assert not (install / "runtime" / "peer_messages").exists()
-    assert_no_model_work(install, "sender", "recipient", "elsewhere")
+            add_child(store, f"worker-{index}", "sender")
+    for sid in ("sender", "recipient", "worker-0", "worker-1"):
+        pin(install, sid, ("peer_sessions",))
+    monkeypatch.setattr(service, "time", SimpleNamespace(monotonic=lambda: 100.0, time=service.time.time))
+    with open_persistence_reader(install) as store:
+        repository = type(store.sessions)
+    real_list, real_owners = repository.list_sessions, service.owners
+    counts = {"scans": 0, "owners": 0}
+
+    def counted_list(*args, **kwargs):
+        counts["scans"] += 1
+        return real_list(*args, **kwargs)
+
+    def counted_owners(*args, **kwargs):
+        counts["owners"] += 1
+        return real_owners(*args, **kwargs)
+
+    monkeypatch.setattr(repository, "list_sessions", counted_list)
+    monkeypatch.setattr(service, "owners", counted_owners)
+    notices = service.InboxNotices()
+    assert work(notices, "sender")["neighbors"] == ["recipient"]
+    assert work(notices, "recipient")["neighbors"] == ["sender"]
+    assert work(notices, "worker-0")["parent"] == "sender"
+    assert work(notices, "worker-1")["parent"] == "sender"
+    assert counts == {"scans": 1, "owners": 1}
+    roots = service.sessions({"scope": "roots"}, "recipient")
+    assert [peer["session_id"] for peer in roots["peers"]] == ["sender"]
+    assert "subagent" not in roots["scan_limited_sources"]
+    full = service.sessions({"scope": "all"}, "recipient")
+    assert "subagent" in full["scan_limited_sources"]
+    assert counts == {"scans": 4, "owners": 3}
 
 
 def test_long_running_owner_not_hidden_by_default_recency_cutoff(install):
@@ -210,110 +251,23 @@ def test_awareness_observes_old_live_owners_without_waiting_for_registry_writer(
         with ThreadPoolExecutor(max_workers=1) as executor:
             with _FileLock(_lock_path(install), timeout=1.0):
                 future = executor.submit(
-                    copy_context().run, notices.before_turn,
-                    session_id="recipient", turn_id="old-owner-turn", platform="desktop",
+                    copy_context().run, work, notices, "recipient", "old-owner-turn",
                 )
                 # The registry writer can remain busy while this normal hook
                 # discovers a live owner outside the persisted recency window.
-                assert future.result(timeout=2.0) == {"context": service.DISCOVERY_HINT}
+                assert future.result(timeout=2.0) == {"authority": "peer_data", "neighbors": ["sender"]}
         assert registry.read_bytes() == before and registry.stat().st_mtime_ns == modified
     finally:
         lease.release()
 
 
-def test_agents_share_candidate_scans_but_explicit_directory_refreshes_once(install, monkeypatch):
-    service = import_module("peer-messaging.service")
-    teams = import_module("peer-messaging.teams")
-    from test_team_delivery import add_child
-
-    readers = ["sender", "recipient"] + [f"worker-{index}" for index in range(8)]
-    with open_persistence(profile_scope(home=install)) as store:
-        for sid in readers[2:]:
-            add_child(store, sid, "sender")
-    for sid in readers:
-        pin(install, sid, ("peer_sessions",))
-    clock = [100.0]
-    monkeypatch.setattr(service, "time", SimpleNamespace(monotonic=lambda: clock[0], time=service.time.time))
-    with open_persistence_reader(install) as store:
-        repository = type(store.sessions)
-    real_list, real_owners, real_resolve = repository.list_sessions, service.owners, teams.resolve
-    counts = {"scans": 0, "owners": 0, "identities": 0}
-
-    def counted_list(*args, **kwargs):
-        counts["scans"] += 1
-        return real_list(*args, **kwargs)
-
-    def counted_owners(*args, **kwargs):
-        counts["owners"] += 1
-        return real_owners(*args, **kwargs)
-
-    def counted_resolve(*args, **kwargs):
-        counts["identities"] += 1
-        return real_resolve(*args, **kwargs)
-
-    monkeypatch.setattr(repository, "list_sessions", counted_list)
-    monkeypatch.setattr(service, "owners", counted_owners)
-    monkeypatch.setattr(teams, "resolve", counted_resolve)
-    for sid in readers:
-        observed = service.InboxNotices().after_tool(
-            tool_name="work", result='{"success": true}', session_id=sid, turn_id="batch",
-        )
-        assert observed is not None
-    assert counts["scans"] == 2 and counts["owners"] == 1, counts
-    # Fresh identity/authorization resolution deliberately remains per caller.
-    assert counts["identities"] > len(readers)
-
-    with open_persistence(profile_scope(home=install)) as store:
-        store.sessions.create(NewSession("late-parent", "cli", cwd="/project/new", git_repo_root="/project"))
-    listed = service.sessions({}, "recipient")
-    assert "late-parent" in {peer["session_id"] for peer in listed["peers"]}
-    assert counts["scans"] == 4 and counts["owners"] == 2
-    transformed = service.InboxNotices().after_tool(
-        tool_name="peer_sessions", result=json.dumps(listed), session_id="recipient", turn_id="explicit",
-    )
-    assert transformed is None
-    assert counts["scans"] == 4 and counts["owners"] == 2
-    clock[0] += service.DISCOVERY_INTERVAL
-    service.InboxNotices().after_tool(
-        tool_name="work", result='{"success": true}', session_id="sender", turn_id="later",
-    )
-    assert counts["scans"] == 6 and counts["owners"] == 3
-
-
-def test_cached_roster_rechecks_visibility_and_link_revocation(install, monkeypatch):
+@pytest.mark.parametrize("compressed", [False, True])
+def test_nested_child_gets_only_parent_and_root_addresses(install, compressed):
     service = import_module("peer-messaging.service")
     from test_team_delivery import add_child
-
-    with open_persistence(profile_scope(home=install)) as store:
-        for sid, parent in (("reader", "sender"), ("sibling", "sender"), ("other-child", "recipient")):
-            add_child(store, sid, parent)
-    pin(install, "reader", ("peer_sessions",))
-    assert call("link_thread", "sender", thread_id="recipient")["success"]
-    assert call("link_thread", "recipient", thread_id="sender")["status"] == "linked"
-    monkeypatch.setattr(service, "time", SimpleNamespace(monotonic=lambda: 100.0, time=service.time.time))
-
-    def directory(turn):
-        result = service.InboxNotices().after_tool(
-            tool_name="work", result='{"success": true}', session_id="reader", turn_id=turn,
-        )
-        return {peer["session_id"] for peer in json.loads(result)["_peer_roster"]["peers"]}
-
-    assert {"sibling", "other-child", "recipient"} <= directory("linked")
-    with open_persistence(profile_scope(home=install)) as store:
-        store.sessions.set_hidden("sibling", True)
-    assert call("link_thread", "sender", thread_id="recipient", action="unlink")["success"]
-    assert directory("revoked") == {"sender"}
-    assert not call("peer_send", "reader", target_session_id="other-child", message="forbidden")["success"]
-
-
-@pytest.mark.parametrize("compressed", [False, True], ids=["original-parents", "compressed-parents"])
-def test_compact_roster_prioritizes_both_parents_without_peer_text(install, compressed):
-    service = import_module("peer-messaging.service")
-    from test_team_delivery import add_child
-
     with open_persistence(profile_scope(home=install)) as store:
         add_child(store, "parent-child", "sender")
-        parent, root = "parent-child", "sender"
+        parent = "parent-child"
         if compressed:
             store.sessions.end(parent, "compression")
             store.sessions.create(NewSession("parent-middle", "subagent", parent_session_id=parent,
@@ -321,30 +275,15 @@ def test_compact_roster_prioritizes_both_parents_without_peer_text(install, comp
             parent = "parent-middle"
         add_child(store, "reader", parent)
         if compressed:
-            # The child was delegated from a middle segment, so neither its
-            # stored parent edge nor the parent's stable thread ID names the tip.
             store.sessions.end(parent, "compression")
             store.sessions.create(NewSession("parent-tip", "subagent", parent_session_id=parent,
                                              model_config={"_delegate_from": "sender", "_subagent_id": "task-parent-child"}))
-            store.sessions.end("sender", "compression")
-            store.sessions.create(NewSession("sender-tip", "cli", parent_session_id="sender"))
-            parent, root = "parent-tip", "sender-tip"
         for index in range(12):
             add_child(store, f"recent-{index}", "sender")
         store.sessions.set_title("sender", "peer-controlled-request")
     pin(install, "reader", ("peer_sessions",))
-    context = start("reader", "roster-turn", platform="subagent")
-    assert context == service.DISCOVERY_HINT and "peer-controlled-request" not in context
-    result = tool("reader", "roster-turn", "list_threads")
-    roster = result["_peer_roster"]
-    assert roster["authority"] == "peer_data" and roster["has_more"]
-    assert {peer["session_id"] for peer in roster["peers"][:2]} == {root, parent}
-    assert 2 < len(roster["peers"]) <= 8
-    assert len(json.dumps(roster, separators=(",", ":"))) <= 4096
-    assert all(set(peer) == {"session_id", "role", "root_thread_id", "parent_session_id", "subagent_id"}
-               for peer in roster["peers"])
-    assert next(peer for peer in roster["peers"] if peer["session_id"] == parent)["subagent_id"] == "task-parent-child"
-    assert "peer-controlled-request" not in json.dumps(result)
-    assert "_peer_roster" not in tool("reader", "roster-turn", "list_threads")
-    assert call("peer_send", "reader", target_session_id=roster["peers"][0]["session_id"],
-                message="addressed without directory lookup")["status"] == "queued"
+    notices = service.InboxNotices()
+    assert work(notices, "reader") == {"authority": "peer_data", "parent": "parent-child", "root": "sender"}
+    assert work(notices, "reader", "next-turn") is None
+    sent = call("peer_send", "reader", target_session_id="parent-child", message="Addressed without directory lookup")
+    assert sent["target_session_id"] == ("parent-tip" if compressed else "parent-child")

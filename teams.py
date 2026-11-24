@@ -20,7 +20,6 @@ class Participant:
     root: SessionRecord
     parent_session_id: str | None
     subagent_id: str | None
-    inbox_ids: tuple[str, ...]
 
     @property
     def is_child(self) -> bool:
@@ -59,18 +58,16 @@ class _Resolver:
             self.rows[sid] = row
         return self.rows[sid]
 
-    def segments(self, row, *, stop_at=None):
-        """Compression ancestors, optionally bounded by a validated local root."""
+    def segments(self, row):
+        """Verified compression ancestry for delegated identities."""
         segments, seen = [row], {row.session_id}
-        while row.session_id != stop_at and row.parent_session_id and self.store.lineage.is_compression_child(row):
+        while row.parent_session_id and self.store.lineage.is_compression_child(row):
             parent = row.parent_session_id
             if parent in seen:
                 raise ValueError("Cyclic session lineage")
             row = self.get(parent)
             segments.append(row)
             seen.add(parent)
-        if stop_at is not None and row.session_id != stop_at:
-            raise ValueError("Local conversation lineage changed; retry routing")
         return tuple(segments)
 
     def live(self, row):
@@ -93,11 +90,7 @@ class _Resolver:
         if not follow and current.session_id != row.session_id:
             raise ValueError("This chat rotated; use its current session")
         current = self.get(current.session_id)
-        # locate already stopped at an archived, foreign, or ineligible ancestor.
-        # The inbox walk must preserve that boundary and keep own mail usable.
-        segments = self.segments(current, stop_at=root_id)
-        return Participant(current, root_id, root_id, current, None, None,
-                           tuple(item.session_id for item in segments))
+        return Participant(current, root_id, root_id, current, None, None)
 
     def team_root(self, row):
         seen = set()
@@ -143,8 +136,7 @@ class _Resolver:
         self.live(current)
         root = self.team_root(first)
         return Participant(current, first.session_id, root.root_id, root.root,
-                           first.parent_session_id, _subagent_id(current) or subagent_id,
-                           tuple(item.session_id for item in segments))
+                           first.parent_session_id, _subagent_id(current) or subagent_id)
 
 
 def resolve(store, sid, *, follow=True, allow_ended=False) -> Participant:

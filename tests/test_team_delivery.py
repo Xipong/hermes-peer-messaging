@@ -137,7 +137,7 @@ def test_parent_alias_targets_immediate_parent_through_compaction(teams):
 
 
 def test_cross_project_parent_consent_enables_only_peer_mail(install):
-    from test_awareness import pin, start
+    from test_awareness import pin, tool
     from test_hermes_projects import project
 
     with open_persistence(profile_scope(home=install)) as store:
@@ -147,14 +147,14 @@ def test_cross_project_parent_consent_enables_only_peer_mail(install):
     assert not call("peer_send", "api-child", **args)["success"]
     pin(install, "elsewhere")
     assert ok("link_thread", "sender", thread_id="elsewhere")["status"] == "awaiting_other_chat"
-    assert "list_threads" in start("elsewhere", "incoming", platform="tui")
-    offer, = ok("list_threads", "elsewhere")["threads"]
+    assert tool("elsewhere", "incoming")["peer_update"]["incoming_links"] == ["sender"]
+    offer, = ok("peer_sessions", "elsewhere")["links"]
     assert offer["thread_id"] == "sender" and offer["link"] == "incoming"
     assert "other-child" not in peers("api-child", same_project=False)
     assert not call("peer_send", "api-child", **args)["success"]
 
     accepted = ok("link_thread", "elsewhere", thread_id="sender")
-    assert accepted["status"] == "linked" and accepted["transcript_shared"] is False
+    assert accepted["status"] == "linked"
     assert "other-child" not in peers("api-child")
     assert "other-child" in peers("api-child", same_project=False)
     sent = ok("peer_send", "api-child", **args)
@@ -162,35 +162,29 @@ def test_cross_project_parent_consent_enables_only_peer_mail(install):
     reply = ok("peer_send", "other-child", target_session_id="api-child", message="Received",
                in_reply_to=sent["message_id"])
     assert ok("peer_receive", "api-child")["messages"][0]["message_id"] == reply["message_id"]
-    assert not call("read_thread", "sender", thread_id="elsewhere")["success"]
-    assert not call("wait_threads", "sender", threads=[{"thread_id": "elsewhere"}], wait_seconds=0)["success"]
-
-    # Changing project membership must not turn a mail-only link into consent to share text.
+    # Changing project membership changes discovery, not the direct link.
     project(install, "Combined project", "/project", "/other")
     assert "other-child" in peers("api-child")
-    assert not call("read_thread", "sender", thread_id="elsewhere")["success"]
-    assert not call("wait_threads", "sender", threads=[{"thread_id": "elsewhere"}], wait_seconds=0)["success"]
-    assert ok("list_threads", "sender")["threads"][0]["transcript_shared"] is False
+    assert ok("peer_sessions", "sender")["links"][0]["link"] == "linked"
     ok("link_thread", "sender", thread_id="elsewhere", action="unlink")
     assert not call("peer_send", "api-child", **args)["success"]
 
 
 def test_pathless_team_discovers_other_batches_and_parent_without_project(install):
     from persistence.conversation.sessions import SessionId
-    from test_awareness import pin, start, tool
+    from test_awareness import pin, tool
 
     with open_persistence(profile_scope(home=install)) as store:
         store.sessions.create(NewSession(SessionId("root"), "desktop"))
         add_child(store, "batch-one", "root")
         add_child(store, "batch-two", "root", cwd="/another-worktree", git_root=None)
     pin(install, "batch-two")
-    assert "across batches" in start("batch-two", "child-turn", platform="subagent", parent="root")
     found = peers("batch-one")
     assert set(found) == {"root", "batch-two"}
     assert found["batch-two"]["root_thread_id"] == "root"
     sent = ok("peer_send", "batch-one", target_session_id=found["batch-two"]["session_id"], message="Across calls")
     notice = tool("batch-two", "child-turn")
-    assert "_peer_inbox_notice" not in notice
+    assert notice["peer_update"]["parent"] == "root" and not notice["peer_update"].get("mail_pending")
     assert notice["peer_data"]["messages"][0]["message_id"] == sent["message_id"]
     assert notice["peer_data"]["messages"][0]["message"] == "Across calls"
     received = ok("peer_receive", "batch-two")
@@ -217,7 +211,7 @@ def test_cross_team_send_holds_consent_until_publication(teams, monkeypatch):
     service = import_module("peer-messaging.service")
     mailbox = import_module("peer-messaging.mailbox")
     enqueue = mailbox.enqueue
-    graph = teams / "runtime" / "peer_messages" / ".threads.json"
+    graph = teams / "runtime" / "peer_messages_v2" / ".threads.json"
     before, modified = graph.read_bytes(), graph.stat().st_mtime_ns
     attempted = []
 
@@ -263,7 +257,7 @@ def test_branched_root_and_its_children_do_not_inherit_team_links(teams):
         add_child(store, "branched-child", "branched-root")
     assert ok("peer_sessions", "branched-child")["root_thread_id"] == "branched-root"
     assert set(peers("branched-child")) == {"branched-root"}
-    assert ok("list_threads", "branched-root")["threads"] == []
+    assert ok("peer_sessions", "branched-root")["links"] == []
     assert not call("peer_send", "branched-child", target_session_id="b1", message="no inherited link")["success"]
     assert not call("peer_send", "a1", target_session_id="branched-child", message="separate root")["success"]
 
@@ -284,6 +278,9 @@ def test_child_compaction_preserves_only_that_childs_mail_and_team(teams):
     assert peers("a1")["b1-tip"]["root_thread_id"] == "recipient"
     followup = ok("peer_send", "a2", target_session_id="b1", message="Resolve old child address")
     assert followup["target_session_id"] == "b1-tip"
+    folder = teams / "runtime" / "peer_messages_v2"
+    assert (folder / "b1" / f"{followup['message_id']}.json").is_file()
+    assert not (folder / "b1-tip").exists()
     assert ok("peer_receive", "b1-tip", action="ack", message_ids=[pending["message_id"]])["acknowledged"] == [pending["message_id"]]
     assert [note["message_id"] for note in ok("peer_receive", "b1-tip")["messages"]] == [followup["message_id"]]
 

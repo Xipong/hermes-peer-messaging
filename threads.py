@@ -1,23 +1,18 @@
-"""Explicitly related, passive local threads. No scheduling or inference here."""
+"""Direct, mutually accepted links between independent local roots."""
 from __future__ import annotations
 
 import json
-import time
 from contextlib import contextmanager
 
 from hermes_cli.active_sessions import _FileLock
 from hermes_constants import get_hermes_home
-from persistence.conversation.messages import TranscriptRead
 from persistence_assembly import open_persistence_reader
 from utils import atomic_json_write
 
 from . import mailbox, service
-from .project_identity import ProjectIndex
 
 _MAX_LINKS = 1024
 _MAX_PEERS = 32
-_SCAN = 80
-_MAX_TEXT = 3000
 
 
 @contextmanager
@@ -38,7 +33,7 @@ def graph(home, *, write=False, locked=False):
         if len(data) > 512_000:
             raise ValueError("Thread link store too large")
         value = json.loads(data)
-        if not isinstance(value, dict) or value.get("version") != 1 or not isinstance(value.get("links"), dict):
+        if not isinstance(value, dict) or value.get("version") != 2 or not isinstance(value.get("links"), dict):
             raise ValueError("Invalid thread link store")
         return value["links"]
     if not (write or locked):
@@ -49,7 +44,7 @@ def graph(home, *, write=False, locked=False):
             links = load()
             yield links
             if write:
-                atomic_json_write(path, {"version": 1, "links": links}, indent=None, mode=0o600)
+                atomic_json_write(path, {"version": 2, "links": links}, indent=None, mode=0o600)
     except RuntimeError as exc:
         if isinstance(exc.__cause__, BlockingIOError):
             raise TimeoutError("Peer links are busy; retry the operation") from exc
@@ -80,37 +75,15 @@ def pair(own, other):
     return ":".join(sorted((own, other)))
 
 
-def same_project(a, b, *, index=None):
-    index = index if index is not None else ProjectIndex(get_hermes_home())
-    a_project = service.project(a, index=index)
-    return a_project is not None and a_project == service.project(b, index=index)
-
-
 def accepted(edge, a, b):
-    return bool(isinstance(edge, dict) and edge.get("since") is not None
-                and set(edge.get("offers", ())) == {a, b})
-
-
-def shares_transcript(edge, own, other, *, index=None):
-    # Legacy links could only be offered in the same project. A mail-only link
-    # must not turn into transcript consent when its participants move.
-    return edge.get("mail_only", False) is False and same_project(own, other, index=index)
+    return isinstance(edge, list) and set(edge) == {a, b}
 
 
 def neighbors(links, own):
-    for key, edge in links.items():
+    for key, offers in links.items():
         left, right = key.split(":")
         if own in (left, right):
-            yield (right if left == own else left), edge
-
-
-def new_edge(links, a, b):
-    key = pair(a, b)
-    if key not in links:
-        if len(links) >= _MAX_LINKS or any(sum(1 for _ in neighbors(links, sid)) >= _MAX_PEERS for sid in (a, b)):
-            raise ValueError("Thread link capacity reached; unlink unused conversations")
-        links[key] = {"offers": [], "since": None}
-    return links[key]
+            yield (right if left == own else left), offers
 
 
 def link(args, sid):
@@ -122,201 +95,37 @@ def link(args, sid):
     with graph(home, write=True) as links, open_persistence_reader(home) as store:
         own_id, own = locate(store, sid)
         if action == "unlink":
-            # The stable ID can revoke a link even if the other chat is gone.
             other_id = requested if pair(own_id, requested) in links else locate(store, requested, allow_ended=True)[0]
             links.pop(pair(own_id, other_id), None)
             return {"success": True, "status": "unlinked", "thread_id": other_id}
         other_id, other = locate(store, requested)
         if not service.same_profile(own.profile_name, other.profile_name):
             raise ValueError("Thread links cannot cross profiles")
-        edge = new_edge(links, own_id, other_id)
-        index = ProjectIndex(home)
-        if edge["since"] is None:
-            if not same_project(own, other, index=index):
-                edge["mail_only"] = True
-            edge["offers"] = sorted({*edge["offers"], own_id})
-            if set(edge["offers"]) == {own_id, other_id}:
-                edge["since"] = time.time()
-        is_linked = accepted(edge, own_id, other_id)
-        status = "linked" if is_linked else "awaiting_other_chat"
-        return {"success": True, "status": status, "thread_id": other_id,
-                "transcript_shared": is_linked and shares_transcript(edge, own, other, index=index),
-                "note": "Both parents must offer the exact link. Once linked, use peer_sessions(same_project=false) "
-                        "to find teammates across projects. Cross-project links grant messaging only; no chat is started."}
+        key = pair(own_id, other_id)
+        if key not in links and (len(links) >= _MAX_LINKS or any(
+                sum(1 for _ in neighbors(links, root)) >= _MAX_PEERS for root in (own_id, other_id))):
+            raise ValueError("Thread link capacity reached; unlink unused conversations")
+        offers = links[key] = sorted({*links.get(key, ()), own_id})
+        return {"success": True, "status": "linked" if accepted(offers, own_id, other_id) else "awaiting_other_chat",
+                "thread_id": other_id}
 
 
-def describe(key, row):
-    return {"thread_id": key, "session_id": row.session_id, "title": row.title,
-            "source": service.surface(row), "started_at": row.started_at,
-            "last_activity_at": row.last_activity_at, "ended_at": row.ended_at, "message_count": row.message_count}
-
-
-def list_threads(args, sid):
-    from . import teams
-
-    home = get_hermes_home()
-    with graph(home) as links, open_persistence_reader(home) as store:
-        participant = teams.resolve(store, sid)
-        own_id, own = participant.root_id, participant.root
-        result = []
-        index = ProjectIndex(home)
-        for other_id, edge in neighbors(links, own_id):
-            try:
-                _, other = locate(store, other_id, allow_ended=True)
-            except ValueError:
-                continue
-            if not service.same_profile(own.profile_name, other.profile_name):
-                continue
-            is_linked = accepted(edge, own_id, other_id)
-            state = "linked" if is_linked else ("offered" if own_id in edge["offers"] else "incoming")
-            result.append({**describe(other_id, other), "link": state,
-                           "transcript_shared": is_linked and shares_transcript(edge, own, other, index=index)})
-        return {"success": True, "thread_id": own_id, "session_id": participant.row.session_id,
-                "root_thread_id": own_id, "threads": result}
-
-
-def linked(store, links, own_id, own, target, *, allow_ended=False):
-    target = mailbox.session_component(target)
-    other_id, row = locate(store, target, allow_ended=allow_ended)
-    edge = links.get(pair(own_id, other_id))
-    if not service.same_profile(own.profile_name, row.profile_name) or not accepted(edge, own_id, other_id):
-        raise ValueError("This thread has not accepted the link. Use link_thread from both chats first.")
-    if not shares_transcript(edge, own, row):
-        raise ValueError("This link does not share transcripts. Use peer_send for coordination.")
-    return other_id, row, edge["since"]
-
-
-def text_only(value):
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        return "\n".join(part["text"] for part in value if isinstance(part, dict)
-                         and part.get("type") in {"text", "input_text", "output_text"}
-                         and isinstance(part.get("text"), str))
-    return ""
-
-
-def public_message(msg, since):
-    if msg.role not in {"user", "assistant"} or msg.timestamp < since or msg.compressed_summary or msg.display_kind or msg.tool_calls:
-        return None
-    meta = msg.display_metadata or {}
-    if msg.role == "assistant":
-        # Only an explicitly finished answer can satisfy a wait; commentary, errors and tool rows cannot.
-        if msg.finish_reason not in {"stop", "end_turn", "completed", "final", "final_answer"}:
-            return None
-        value = msg.content
-    else:
-        if meta.get("withheld_prompt") or msg.api_content is not None and "typed_ask" not in meta:
-            return None
-        value = meta.get("typed_ask", msg.content)
-    text = text_only(value)
-    if not text.strip():
-        return None
-    return {"row_id": int(msg.id), "role": msg.role, "text": text[:_MAX_TEXT],
-            "truncated": len(text) > _MAX_TEXT, "timestamp": msg.timestamp}
-
-
-def recent(store, row, since, *, limit=5, after=0, roles=("user", "assistant")):
-    out, limited = [], []
-    with store.messages.read_snapshot() as snapshot:
-        for role in roles:
-            found = 0
-            for offset in range(_SCAN):
-                candidate = store.messages.latest_row_id(row.session_id, role=role, offset=offset,
-                                                        require_text=role == "assistant")
-                if candidate is None or candidate <= after:
-                    break
-                # Select the exact active row, retaining summary/visibility metadata.
-                messages = store.messages.read_transcript(row.session_id, TranscriptRead(after_id=candidate - 1, limit=1))
-                if messages and messages[0].id == candidate:
-                    if message := public_message(messages[0], since):
-                        out.append(message)
-                        found += 1
-                        if found >= limit:
-                            break
-            else:
-                older = store.messages.latest_row_id(row.session_id, role=role, offset=_SCAN,
-                                                    require_text=role == "assistant")
-                if older is not None and older > after:
-                    limited.append(role)
-        if not snapshot():
-            raise ValueError("Thread transcript changed during the read; retry the observation")
-    out.sort(key=lambda message: message["row_id"])
-    final = next((message["row_id"] for message in reversed(out) if message["role"] == "assistant"), None)
-    return {"messages": out[-limit:], "latest_final_row_id": final,
-            "scan_limit_per_role": _SCAN, "scan_limited_roles": limited}
-
-
-def read_thread(args, sid):
-    home = get_hermes_home()
-    limit = args.get("limit", 5)
-    if type(limit) is not int or not 1 <= limit <= 10:
-        raise ValueError("limit must be 1–10")
-    with graph(home) as links, open_persistence_reader(home) as store:
-        own_id, own = locate(store, sid)
-        other_id, row, since = linked(store, links, own_id, own, args.get("thread_id"), allow_ended=True)
-        data = recent(store, row, since, limit=limit)
-        return {"success": True, "authority": "peer_data", **describe(other_id, row), **data, "shared_since": since,
-                "note": "Public text from the current segment after link acceptance. scan_limited_roles names incomplete scans; not a live turn status."}
-
-
-def wait_threads(args, sid):
-    # Keep old frozen pins callable, but never schedule a wait from their arguments.
-    unknown = set(args) - {"threads", "wait_seconds"}
-    if unknown:
-        raise ValueError("Unknown wait_threads argument(s): " + ", ".join(sorted(unknown)))
-    targets = args.get("threads")
-    wait = args.get("wait_seconds", 0)
-    if not isinstance(targets, list) or not 1 <= len(targets) <= 5 or type(wait) not in (float, int) or not 0 <= wait <= 30:
-        raise ValueError("Supply 1–5 threads; legacy wait_seconds must be between 0 and 30 and is ignored")
-    compatibility = {"wait_seconds_ignored": True} if "wait_seconds" in args else {}
-    cursors = {}
-    for item in targets:
-        if not isinstance(item, dict) or set(item) - {"thread_id", "after_row_id"}:
-            raise ValueError("Expected thread_id and optional after_row_id per observation")
-        target = mailbox.session_component(item.get("thread_id"))
-        after = item.get("after_row_id", 0)
-        if type(after) is not int or after < 0 or target in cursors:
-            raise ValueError("Use unique thread IDs and non-negative after_row_id values")
-        cursors[target] = after
-    home = get_hermes_home()
-    with graph(home) as links, open_persistence_reader(home) as store:
-        own_id, own = locate(store, sid)
-        ready, pending, closed, limited = [], [], [], []
-        for target, cursor in cursors.items():
-            other_id, row, since = linked(store, links, own_id, own, target, allow_ended=True)
-            observation = recent(store, row, since, limit=1, after=cursor, roles=("assistant",))
-            final = next(iter(observation["messages"]), None)
-            if observation["scan_limited_roles"]:
-                limited.append(other_id)
-            if final:
-                ready.append({"thread_id": other_id, "session_id": row.session_id, "result": final})
-            elif row.ended_at is not None:
-                closed.append(other_id)
-            else:
-                pending.append(other_id)
-    status = "ready" if ready else "scan_limit" if limited else "pending" if pending else "closed"
-    return {"success": True, "authority": "peer_data", "status": status, "ready": ready,
-            "pending": pending, "closed": closed, "scan_limited": limited, "scan_limit_per_role": _SCAN,
-            **compatibility,
-            "note": "Immediate snapshot of saved finals in the current segment; pending is not a running-turn status. "
-                    "scan_limited names incomplete scans. Continue your task instead of polling; mail arrives with ordinary tool results. "
-                    "Native delegate_task reports child completion. No chat was started."}
-
-
-def register(ctx):
-    def add(name, operation, description, properties, required=(), *, legacy_args=False):
-        ctx.register_tool(name=name, toolset=service.TOOLSET, check_fn=service.requirements,
-                          handler=service.handler(operation), emoji="🧵", schema={"name": name,
-                              "description": description, "parameters": {"type": "object", "properties": properties,
-                              "required": list(required), "additionalProperties": legacy_args}})
-    id_field = {"type": "string", "description": "Exact thread_id or current session_id"}
-    add("list_threads", list_threads, "List your team's directly linked local parent chats and pending offers. Delegated agents inherit their root parent's directory. No wake.", {})
-    add("link_thread", link, "For independent local parents in one profile: propose or revoke a link between teams. Both must offer; links are not transitive. Linked teams can message each other across projects. Only links formed in the same project can share new public parent text. No prompt is sent.",
-        {"thread_id": id_field, "action": {"type": "string", "enum": ["offer", "unlink"]}}, ("thread_id",))
-    add("read_thread", read_thread, "For independent parents: read bounded public text after a shared-transcript link in the same project. Mail-only links do not grant access. Delegated agents receive mail as peer_data with their tool results. scan_limited_roles reports incomplete scans. No raw tool results, reasoning, or wake.",
-        {"thread_id": id_field, "limit": {"type": "integer", "minimum": 1, "maximum": 10}}, ("thread_id",))
-    add("wait_threads", wait_threads, "For independent parents: take one immediate snapshot of saved finals newer than the cursor on same-project shared-transcript links. Never waits. pending means no saved final was found, not that a turn is running. Continue your task instead of polling. Mail arrives as peer_data with ordinary tool results; native delegate_task reports child completion. scan_limit reports an incomplete search. Does not launch or resume anyone.",
-        {"threads": {"type": "array", "minItems": 1, "maxItems": 5, "items": {"type": "object", "properties": {
-            "thread_id": id_field, "after_row_id": {"type": "integer", "minimum": 0}}, "required": ["thread_id"], "additionalProperties": False}}},
-        ("threads",), legacy_args=True)
+def directory(store, own, links, *, incoming_only=False):
+    """Link management is independent of project/recency and peer search scope."""
+    result = []
+    for other_id, offers in neighbors(links, own.root_id):
+        state = "linked" if accepted(offers, own.root_id, other_id) else (
+            "offered" if own.root_id in offers else "incoming")
+        if incoming_only and state != "incoming":
+            continue
+        other = None
+        try:
+            _, candidate = locate(store, other_id, allow_ended=True)
+            if service.same_profile(own.root.profile_name, candidate.profile_name):
+                other = candidate
+        except ValueError:
+            pass
+        # Keep the stable link address revocable even if the peer disappeared.
+        result.append({"thread_id": other_id, "session_id": other.session_id if other else None,
+                       "ended_at": other.ended_at if other else None, "link": state})
+    return result

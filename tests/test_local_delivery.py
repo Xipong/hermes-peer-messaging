@@ -1,7 +1,6 @@
 """Plugin discovery and delivery through the installed Hermes tool dispatcher, without inference."""
 import json
 import shutil
-from copy import deepcopy
 from importlib import import_module
 from pathlib import Path
 
@@ -54,15 +53,14 @@ def test_only_local_same_project_and_explicit_cross_project(install):
     from model_tools import get_tool_definitions
     defs = get_tool_definitions(enabled_toolsets=["peer_messaging"], skip_tool_search_assembly=True, quiet_mode=True)
     assert {tool["function"]["name"] for tool in defs} == {
-        "peer_sessions", "peer_send", "peer_receive", "list_threads", "link_thread",
-        "read_thread", "wait_threads",
+        "peer_sessions", "peer_send", "peer_receive", "link_thread",
     }
     assert [p["session_id"] for p in call("peer_sessions", "sender")["peers"]] == ["recipient"]
     assert {p["session_id"] for p in call("peer_sessions", "sender", same_project=False)["peers"]} == {"recipient", "elsewhere"}
     for refused in ("managed", "foreign", "delegate", "sender", "../recipient"):
         assert not call("peer_send", "sender", target_session_id=refused, message="note")["success"]
     assert not call("peer_send", "delegate", target_session_id="recipient", message="note")["success"]
-    assert not (install / "runtime" / "peer_messages").exists()
+    assert not (install / "runtime" / "peer_messages_v2").exists()
 
 
 def test_delivery_uses_runtime_identity_and_never_starts_a_turn(install):
@@ -114,63 +112,36 @@ def test_compression_inherits_inbox_but_branch_does_not(install):
         assert store.lineage.chain("recipient") == ("recipient", "tip")
     assert call("peer_receive", "branch")["messages"] == []
     assert call("peer_receive", "tip")["messages"][0]["message_id"] == sent["message_id"]
-    assert call("peer_send", "sender", target_session_id="recipient", message="for the current tip")["target_session_id"] == "tip"
+    second = call("peer_send", "sender", target_session_id="recipient", message="for the current tip")
+    assert second["target_session_id"] == "tip"
+    folder = install / "runtime" / "peer_messages_v2"
+    assert (folder / "recipient" / f"{second['message_id']}.json").is_file()
+    assert not (folder / "tip").exists()
+    assert [item["message_id"] for item in call("peer_receive", "tip")["messages"]] == [sent["message_id"], second["message_id"]]
     assert call("peer_receive", "tip", action="ack", message_ids=[sent["message_id"]])["acknowledged"] == [sent["message_id"]]
 
 
-@pytest.mark.parametrize("deferred", [False, True], ids=["direct", "tool_call"])
-def test_legacy_receive_wait_is_immediate_through_native_dispatch(install, monkeypatch, deferred):
+def test_removed_legacy_wait_argument_is_rejected_and_explicit_ack_is_supported(install):
     from model_tools import get_tool_definitions
-
     definitions = get_tool_definitions(enabled_toolsets=["peer_messaging"],
                                        skip_tool_search_assembly=True, quiet_mode=True)
-    advertised = next(tool for tool in definitions if tool["function"]["name"] == "peer_receive")
-    legacy = deepcopy(advertised)
-    legacy["function"]["parameters"]["properties"]["wait_seconds"] = {
-        "type": "number", "minimum": 0, "maximum": 30, "default": 0,
-    }
-    with open_persistence(profile_scope(home=install)) as store:
-        store.sessions.update_tool_pin("recipient", {"tools": [legacy]})
-
-    def receive(**args):
-        if deferred:
-            return call("tool_call", "recipient", calls=[{"name": "peer_receive", "arguments": args}])
-        return call("peer_receive", "recipient", **args)
-
-    def no_sleep(_seconds):
-        pytest.fail("peer_receive must return its current snapshot without waiting for new mail")
-
-    service = import_module("peer-messaging.service")
-    monkeypatch.setattr(service.time, "sleep", no_sleep)
-    empty = receive(wait_seconds=30)
-    assert empty.get("success"), empty
-    assert empty["messages"] == [] and empty["wait_seconds_ignored"] is True
-
+    receive = next(tool for tool in definitions if tool["function"]["name"] == "peer_receive")
+    schema = receive["function"]["parameters"]
+    assert not schema["additionalProperties"]
+    assert set(schema["properties"]) == {"action", "limit", "message_ids"}
     sent = call("peer_send", "sender", target_session_id="recipient", message="Keep until explicit ACK")
-    read = receive(wait_seconds=30)
-    assert [message["message_id"] for message in read["messages"]] == [sent["message_id"]]
-    assert read["wait_seconds_ignored"] is True
-    repeated = receive()
-    assert repeated["messages"] == read["messages"]
-    assert "wait_seconds_ignored" not in repeated
-    ack = receive(action="ack", message_ids=[sent["message_id"]], wait_seconds=30)
-    assert ack["acknowledged"] == [sent["message_id"]]
-    assert ack["wait_seconds_ignored"] is True
-    assert receive()["messages"] == []
-
-    # The compatibility allowance must not turn misspelled arguments or caller
-    # identity overrides into a silently successful operation.
-    for args in ({"current_session_id": "sender"}, {"wait_second": 30}):
-        refused = receive(**args)
+    for args in ({"wait_seconds": 30}, {"current_session_id": "sender"}, {"wait_second": 30}):
+        refused = call("peer_receive", "recipient", **args)
         assert refused.get("success") is False and "error" in refused, refused
-    assert "wait_seconds" not in advertised["function"]["parameters"]["properties"]
+    assert call("peer_receive", "recipient")["messages"][0]["message_id"] == sent["message_id"]
+    assert call("peer_receive", "recipient", action="ack", message_ids=[sent["message_id"]])["acknowledged"] == [sent["message_id"]]
 
 
 def test_contended_session_metadata_is_retryable_without_consuming_mail(install):
     from persistence_assembly import open_store_admin, store_location
 
     sent = call("peer_send", "sender", target_session_id="recipient", message="Keep during metadata contention")
-    envelope = install / "runtime" / "peer_messages" / "recipient" / f"{sent['message_id']}.json"
+    envelope = install / "runtime" / "peer_messages_v2" / "recipient" / f"{sent['message_id']}.json"
     original = envelope.read_bytes()
     path = store_location(profile_scope(home=install))
     with open_store_admin(path, read_only=False).exclusive_repair_guard():
@@ -183,3 +154,18 @@ def test_contended_session_metadata_is_retryable_without_consuming_mail(install)
     recovered = call("peer_receive", "recipient")
     assert [message["message_id"] for message in recovered["messages"]] == [sent["message_id"]]
     assert call("peer_receive", "recipient", action="ack", message_ids=[sent["message_id"]])["acknowledged"] == [sent["message_id"]]
+
+
+def test_new_storage_ignores_previous_version_without_migration(install):
+    from importlib import import_module
+
+    legacy = install / "runtime" / "peer_messages" / "recipient"
+    box = import_module("peer-messaging.mailbox")
+    old = box.enqueue(legacy, sender="sender", target="recipient", text="Old session mail")
+    original = (legacy / f"{old['message_id']}.json").read_bytes()
+    (legacy.parent / ".threads.json").write_text('{"version":1,"links":{}}')
+    assert call("peer_receive", "recipient")["messages"] == []
+    sent = call("peer_send", "sender", target_session_id="recipient", message="New session mail")
+    assert [item["message_id"] for item in call("peer_receive", "recipient")["messages"]] == [sent["message_id"]]
+    assert (legacy / f"{old['message_id']}.json").read_bytes() == original
+    assert (install / "runtime" / "peer_messages_v2" / "recipient").is_dir()

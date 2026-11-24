@@ -23,7 +23,6 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGE_CHARS = 8_000
 MAX_PENDING_MESSAGES = 50
 MAX_READ_MESSAGES = 5
-# Keep Teknium's filenames, including messages queued by the original branch.
 _MESSAGE_ID = re.compile(r"[0-9]{20}_[0-9a-f]{8}")
 _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 MAX_ENVELOPE_BYTES = 64_000
@@ -77,21 +76,17 @@ def _load(path: Path) -> dict[str, Any] | None:
     body = entry.get("message")
     if not isinstance(body, str) or not body.strip() or len(body) > MAX_MESSAGE_CHARS:
         return None
-    if entry.get("message_id", path.stem) != path.stem:
+    if entry.get("message_id") != path.stem:
         return None
-    # Old envelopes have no message_id/target/reply. Keep them readable without
-    # allowing malformed metadata to inflate or spoof the returned envelope.
     try:
         for field in ("from_session_id", "target_session_id"):
-            if entry.get(field) is not None:
-                session_component(entry[field])
+            session_component(entry.get(field))
         if entry.get("in_reply_to") is not None:
             message_id(entry["in_reply_to"])
     except ValueError:
         return None
     sent_at = entry.get("sent_at")
-    if sent_at is not None and (isinstance(sent_at, bool) or not isinstance(sent_at, (int, float))
-                               or not math.isfinite(sent_at)):
+    if isinstance(sent_at, bool) or not isinstance(sent_at, (int, float)) or not math.isfinite(sent_at):
         return None
     # Project only data fields; no envelope-provided role/authority/control flags.
     return {"message_id": path.stem, "from_session_id": entry.get("from_session_id"),
@@ -130,12 +125,12 @@ def enqueue(inbox: Path, *, sender: str, target: str, text: str,
         return entry
 
 
-def pending_ids(inboxes: list[Path]) -> frozenset[str]:
-    """Content-free hint snapshot. A concurrent ACK/send is handled by the next poll."""
-    return frozenset(path.stem for inbox in inboxes if inbox.is_dir() for path in _paths(inbox))
+def pending_ids(inbox: Path) -> frozenset[str]:
+    """Content-free hint snapshot for one logical participant."""
+    return frozenset(path.stem for path in _paths(inbox))
 
 
-def read_pending(inboxes: list[Path], *, limit: int = MAX_READ_MESSAGES) -> dict[str, Any]:
+def read_pending(inbox: Path, *, limit: int = MAX_READ_MESSAGES) -> dict[str, Any]:
     """Read an inbox snapshot without waiting for a sender or ACK's write lock.
 
     Envelopes are immutable and published by atomic rename, so readers see a
@@ -146,15 +141,7 @@ def read_pending(inboxes: list[Path], *, limit: int = MAX_READ_MESSAGES) -> dict
     """
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_READ_MESSAGES:
         raise ValueError(f"limit must be between 1 and {MAX_READ_MESSAGES}")
-    paths = []
-    for inbox in inboxes:
-        if not inbox.is_dir():
-            continue
-        if inbox.is_symlink():
-            raise ValueError("Peer inbox must not be a symlink")
-        paths.extend(_paths(inbox))
-    # Compression ancestry can contain older and newer mail in either directory.
-    paths.sort(key=lambda path: path.stem)
+    paths = _paths(inbox)
     entries, unreadable, inspected, pending = [], 0, 0, len(paths)
     for path in paths:
         if len(entries) == limit:
@@ -179,17 +166,15 @@ def read_pending(inboxes: list[Path], *, limit: int = MAX_READ_MESSAGES) -> dict
             "unreadable_count": unreadable}
 
 
-def acknowledge(inboxes: list[Path], ids: list[str], *, lock_timeout=2.0) -> dict[str, Any]:
-    """Only the caller's inboxes are supplied. Repeated ACKs never consume a neighbor."""
+def acknowledge(inbox: Path, ids: list[str], *, lock_timeout=2.0) -> dict[str, Any]:
+    """Only the caller's stable inbox is supplied. ACKs cannot consume a neighbor."""
     if not isinstance(ids, list) or not ids or len(ids) > MAX_PENDING_MESSAGES:
         raise ValueError(f"message_ids must contain 1–{MAX_PENDING_MESSAGES} IDs")
     wanted = list(dict.fromkeys(message_id(key) for key in ids))  # validate before any mutation
     acknowledged, failed = set(), set()
-    for inbox in inboxes:
-        if not inbox.is_dir():
-            continue
-        if inbox.is_symlink():
-            raise ValueError("Peer inbox must not be a symlink")
+    if inbox.is_symlink():
+        raise ValueError("Peer inbox must not be a symlink")
+    if inbox.is_dir():
         with _locked(inbox, timeout=lock_timeout):
             for key in wanted:
                 path = inbox / f"{key}.json"
