@@ -14,11 +14,11 @@ from test_local_delivery import call, install  # noqa: F401
 
 
 def inbox(home):
-    return home / "runtime" / "peer_messages" / "recipient"
+    return home / "runtime" / "peer_messages_v2" / "recipient"
 
 
 def pending(home):
-    return import_module("peer-messaging.mailbox").read_pending([inbox(home)])
+    return import_module("peer-messaging.mailbox").read_pending(inbox(home))
 
 
 def queue(message="A peer finding; continue the existing task"):
@@ -31,7 +31,7 @@ def attach(delivery, home, *, tool_call_id="work-call", api_request_id="producin
     snapshot = pending(home)
     return delivery.attach(
         '{"output":"ordinary tool completed"}', session_id="recipient", turn_id="active-turn",
-        api_request_id=api_request_id, tool_call_id=tool_call_id, inboxes=[inbox(home)],
+        api_request_id=api_request_id, tool_call_id=tool_call_id, inbox=inbox(home),
         messages=snapshot["messages"], has_more=snapshot["has_more"],
     )
 
@@ -321,7 +321,7 @@ def test_explicit_receive_tracks_new_mail_after_a_prepared_carrier(install):
     snapshot = pending(install)
     second = delivery.attach('{"success":true}', session_id="recipient", turn_id="active-turn",
                              api_request_id="producing-request", tool_call_id="read-call", explicit=True,
-                             inboxes=[inbox(install)], messages=snapshot["messages"], has_more=snapshot["has_more"])
+                             inbox=inbox(install), messages=snapshot["messages"], has_more=snapshot["has_more"])
     assert [item["message_id"] for item in json.loads(second)["peer_data"]["messages"]] == [second_key]
     assert first_key not in second
     rows = [persist(install, tool_row(first)), persist(install, tool_row(second, "read-call"))]
@@ -405,9 +405,9 @@ def test_real_executor_and_host_request_hooks_require_durable_delivery(install, 
             assert tool["content"].count(body) == 1
             if fallback:
                 assert payload["success"] and not {"messages", "has_more", "note"} & payload.keys()
-            service = import_module("peer-messaging.service")
-            assert payload["_peer_discovery_notice"] == service.DISCOVERY_HINT
-            assert payload["_peer_link_notice"] == service.LINK_HINT
+            assert payload["peer_update"]["neighbors"] == ["sender"]
+            assert payload["peer_update"]["incoming_links"] == ["sender"]
+            assert not payload["peer_update"].get("mail_pending")
             assert pending(install)["pending_count"] == 1
             outbound = [{name: value for name, value in row.items()
                          if name in {"role", "content", "tool_calls", "tool_call_id"}} for row in rows]

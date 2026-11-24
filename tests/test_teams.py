@@ -29,7 +29,7 @@ def test_nested_children_keep_team_identity_when_parent_compresses(install):
         assert worker.root_id == root.thread_id == "sender"
         assert worker.root.session_id == root.row.session_id == "sender-tip"
         assert worker.parent_session_id == "a1"
-        assert worker.inbox_ids == ("nested",)
+        assert worker.thread_id == "nested"
         assert teams.allowed(worker, root, {})
         assert teams.describe(worker) == {
             "session_id": "nested", "thread_id": "nested", "root_thread_id": "sender",
@@ -50,7 +50,6 @@ def test_child_compression_follows_ancestry_not_reused_subagent_id(install):
         assert worker.row.session_id == "a1-tip"
         assert worker.thread_id == "a1" and worker.root_id == "sender"
         assert worker.parent_session_id == "sender"
-        assert worker.inbox_ids == ("a1-tip", "a1")
         assert teams.resolve(store, "a1-tip", follow=False) == worker
         with pytest.raises(ValueError, match="rotated"):
             teams.resolve(store, "a1", follow=False)
@@ -80,11 +79,11 @@ def test_links_grant_direct_teams_only_and_revocation_is_immediate(install):
             child(store, sid, parent)
     with open_persistence_reader(install) as store:
         a, sibling, b, c, branch = (teams.resolve(store, sid) for sid in ("a1", "a2", "b1", "c1", "branch-child"))
-        links = {"recipient:sender": {"offers": ["sender"], "since": None}}
+        links = {"recipient:sender": ["sender"]}
         assert teams.allowed(a, sibling, links)
         assert not teams.allowed(a, b, links)
-        links["recipient:sender"] = {"offers": ["sender", "recipient"], "since": 1.0}
-        links["recipient:third"] = {"offers": ["recipient", "third"], "since": 1.0}
+        links["recipient:sender"] = ["sender", "recipient"]
+        links["recipient:third"] = ["recipient", "third"]
         assert teams.allowed(a, b, links) and teams.allowed(b, c, links)
         assert not teams.allowed(a, c, links)
         assert branch.root_id == "branch" and not teams.allowed(branch, a, links)
@@ -144,12 +143,12 @@ def test_local_inbox_stops_at_validated_root_and_keeps_own_mail_usable(install, 
         store.sessions.create(NewSession("tip", "cli", parent_session_id="old", cwd="/project",
                                          git_repo_root="/project", profile_name="default"))
     box = import_module("peer-messaging.mailbox")
-    inbox = install / "runtime" / "peer_messages"
+    inbox = install / "runtime" / "peer_messages_v2"
     old_mail = box.enqueue(inbox / "old", sender="sender", target="old", text="ancestor-only mail")
     own_mail = box.enqueue(inbox / "tip", sender="sender", target="tip", text="own mail")
     with open_persistence_reader(install) as store:
         participant = teams.resolve(store, "tip")
-        assert participant.root_id == "tip" and participant.inbox_ids == ("tip",)
+        assert participant.root_id == participant.thread_id == "tip"
     received = call("peer_receive", "tip")
     assert received.get("success"), received
     assert received["messages"] == [own_mail]

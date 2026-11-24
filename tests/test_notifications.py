@@ -26,17 +26,17 @@ def pin_receive(home, sid="recipient"):
 
 def test_new_mail_rides_a_running_tool_result_without_wake(install):
     pin_receive(install)
-    assert not {"_peer_inbox_notice", "peer_data"} & poll().keys()
+    assert not {"peer_update", "peer_data"} & poll().keys()
     first = call("peer_send", "sender", target_session_id="recipient", message="private-note-one")
     noticed = poll()
-    assert noticed["success"] and "_peer_inbox_notice" not in noticed
+    assert noticed["success"] and "peer_update" not in noticed
     assert [message["message"] for message in noticed["peer_data"]["messages"]] == ["private-note-one"]
-    assert not {"_peer_inbox_notice", "peer_data"} & poll().keys()
+    assert not {"peer_update", "peer_data"} & poll().keys()
 
     second = call("peer_send", "sender", target_session_id="recipient", message="private-note-two")
     # The same tool call cannot receive a second carrier before its request.
     fallback = poll()
-    assert "peer_receive" in fallback["_peer_inbox_notice"] and "peer_data" not in fallback
+    assert fallback["peer_update"]["mail_pending"] is True and "peer_data" not in fallback
     assert "private-note-two" not in json.dumps(fallback)
     next_turn = poll(turn="next-turn")
     assert [message["message_id"] for message in next_turn["peer_data"]["messages"]] == [
@@ -47,15 +47,15 @@ def test_new_mail_rides_a_running_tool_result_without_wake(install):
     page = call("peer_receive", "recipient")
     assert [message["message_id"] for message in page["messages"]] == [first["message_id"], second["message_id"]]
     call("peer_receive", "recipient", action="ack", message_ids=[first["message_id"], second["message_id"]])
-    assert "_peer_inbox_notice" not in poll()
+    assert "peer_update" not in poll()
 
 
 def test_mid_turn_delivery_requires_the_recipient_tool_pin(install):
     call("peer_send", "sender", target_session_id="recipient", message="pending")
-    assert not {"_peer_inbox_notice", "peer_data"} & poll().keys()
+    assert not {"peer_update", "peer_data"} & poll().keys()
     pin_receive(install)
     assert "peer_data" in poll()
-    assert not {"_peer_inbox_notice", "peer_data"} & poll(sid="elsewhere").keys()
+    assert not {"peer_update", "peer_data"} & poll(sid="elsewhere").keys()
     assert call("peer_receive", "recipient")["pending_count"] == 1
 
 
@@ -68,7 +68,7 @@ def test_notices_preserve_json_array_and_scalar_results(install, result):
     assert notices.after_tool(result=result, **kwargs) is None
     carried = notices.after_tool(result='{"value": 1}', **kwargs)
     assert json.loads(carried)["value"] == 1
-    assert "peer_receive" in json.loads(carried)["_peer_inbox_notice"]
+    assert json.loads(carried)["peer_update"]["mail_pending"] is True
     assert notices.after_tool(result='{"value": 2}', **kwargs) is None
 
 
@@ -82,7 +82,7 @@ def test_delegated_agent_notices_only_its_own_mail(install):
         ))
     pin_receive(install, "child")
     call("peer_send", "recipient", target_session_id="sender", message="parent-only")
-    assert not {"_peer_inbox_notice", "peer_data"} & poll(sid="child").keys()
+    assert not {"peer_update", "peer_data"} & poll(sid="child").keys()
     sent = call("peer_send", "sender", target_session_id="child", message="child-only")
     assert sent["success"]
     carried = poll(sid="child")

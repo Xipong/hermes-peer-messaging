@@ -52,7 +52,7 @@ def test_nested_named_project_takes_precedence_over_shared_git_root(install):
     assert call("peer_send", "sender", target_session_id="recipient", message="heads up")["status"] == "queued"
     assert call("link_thread", "sender", thread_id="recipient")["status"] == "awaiting_other_chat"
     link = call("link_thread", "recipient", thread_id="sender")
-    assert link["status"] == "linked" and link["transcript_shared"] is False
+    assert link["status"] == "linked"
 
 
 def test_active_project_pointer_and_pathless_project_do_not_claim_unrelated_chat(install):
@@ -89,10 +89,10 @@ def test_same_running_turn_discovers_new_native_project_peer_on_tool_result(inst
     create(install, "web", "/new-repo/web", "/new-repo")
     clock[0] += service.DISCOVERY_INTERVAL
     result = json.loads(handle_function_call(
-        "list_threads", {}, session_id="sender", turn_id="hours-long-turn",
+        "peer_receive", {}, session_id="sender", turn_id="hours-long-turn",
         tool_call_id="still-same-turn", enabled_toolsets=["peer_messaging"],
     ))
-    assert result["_peer_discovery_notice"] == service.DISCOVERY_HINT
+    assert result["peer_update"]["neighbors"] == ["web"]
     assert call("peer_sessions", "sender")["hermes_project_id"] is not None
     with open_persistence_reader(install) as store:
         assert store.sessions.get("web").api_call_count == 0
