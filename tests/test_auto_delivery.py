@@ -288,7 +288,7 @@ def test_explicit_receive_deduplicates_prepared_batch_but_keeps_unproven_mail(in
     body = "A finding carried once in this batch"
     key = queue(body)
     with open_persistence(profile_scope(home=install)) as store:
-        store.sessions.update_tool_pin("recipient", {"tools": ["peer_receive"]})
+        store.sessions.update_tool_pin("recipient", {"tools": [{"function": {"name": "peer_receive"}}]})
     delivery = new_delivery()
     notices = service.InboxNotices(delivery)
     args = dict(session_id="recipient", turn_id="active-turn", api_request_id="producing-request")
@@ -403,7 +403,7 @@ def test_real_executor_and_host_request_hooks_require_durable_delivery(install, 
             assert payload["peer_data"]["messages"][0]["message_id"] == key
             assert tool["content"].count(body) == 1
             if fallback:
-                assert payload["success"] and not {"messages", "has_more", "note"} & payload.keys()
+                assert payload["success"] and not {"messages", "has_more", "note", "authority"} & payload.keys()
             assert payload["peer_update"]["neighbors"] == ["sender"]
             assert not payload["peer_update"].get("mail_pending")
             assert pending(install)["pending_count"] == 1

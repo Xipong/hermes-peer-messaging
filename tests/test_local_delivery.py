@@ -121,7 +121,7 @@ def test_compression_inherits_inbox_but_branch_does_not(install):
     assert call("peer_receive", "tip", action="ack", message_ids=[sent["message_id"]])["acknowledged"] == [sent["message_id"]]
 
 
-def test_removed_legacy_wait_argument_is_rejected_and_explicit_ack_is_supported(install):
+def test_receive_rejects_unknown_arguments_and_supports_explicit_ack(install):
     from model_tools import get_tool_definitions
     definitions = get_tool_definitions(enabled_toolsets=["peer_messaging"],
                                        skip_tool_search_assembly=True, quiet_mode=True)
@@ -130,7 +130,7 @@ def test_removed_legacy_wait_argument_is_rejected_and_explicit_ack_is_supported(
     assert not schema["additionalProperties"]
     assert set(schema["properties"]) == {"action", "limit", "message_ids"}
     sent = call("peer_send", "sender", target_session_id="recipient", message="Keep until explicit ACK")
-    for args in ({"wait_seconds": 30}, {"current_session_id": "sender"}, {"wait_second": 30}):
+    for args in ({"unexpected": 30}, {"current_session_id": "sender"}):
         refused = call("peer_receive", "recipient", **args)
         # Hermes rejects unknown parameters before invoking the plugin handler.
         assert not refused.get("success") and "error" in refused, refused
@@ -160,16 +160,17 @@ def test_contended_session_metadata_is_retryable_without_consuming_mail(install)
     assert call("peer_receive", "recipient", action="ack", message_ids=[sent["message_id"]])["acknowledged"] == [sent["message_id"]]
 
 
-def test_new_storage_ignores_previous_version_without_migration(install):
-    from importlib import import_module
-
-    legacy = install / "runtime" / "peer_messages" / "recipient"
-    box = import_module("peer-messaging.mailbox")
-    old = box.enqueue(legacy, sender="sender", target="recipient", text="Old session mail")
-    original = (legacy / f"{old['message_id']}.json").read_bytes()
-    (legacy.parent / ".threads.json").write_text('{"version":1,"links":{}}')
-    assert call("peer_receive", "recipient")["messages"] == []
-    sent = call("peer_send", "sender", target_session_id="recipient", message="New session mail")
-    assert [item["message_id"] for item in call("peer_receive", "recipient")["messages"]] == [sent["message_id"]]
-    assert (legacy / f"{old['message_id']}.json").read_bytes() == original
-    assert (install / "runtime" / "peer_messages_v2" / "recipient").is_dir()
+@pytest.mark.parametrize("pin, expected", [
+    ({"tools": [{"function": {"name": "peer_receive"}}]}, True),
+    ({"tools": [{"function": {"name": "tool_search", "description":
+        "Deferred tool catalog (call schemas via tool_describe):\n- peer_receive: Read mail"}}]}, True),
+    ({"tools": [{"function": {"name": "tool_search", "description":
+        "Deferred tool catalog (call schemas via tool_describe):\npeer_messaging tools (3):\npeer_receive, peer_send, peer_sessions"}}]}, True),
+    ({"tools": [{"function": {"name": "tool_search", "description": None}}]}, False),
+    ({"tools": ["peer_receive"]}, False),
+    ([{"function": {"name": "peer_receive"}}], False),
+    (None, False),
+])
+def test_current_structured_tool_pin_and_deferred_catalog(pin, expected):
+    service = import_module("peer-messaging.service")
+    assert service.pin_has_tool(pin, "peer_receive") is expected

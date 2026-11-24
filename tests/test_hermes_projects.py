@@ -32,12 +32,12 @@ def test_explicit_project_spans_separate_repositories_and_delegated_teams(instal
     assert peers["hermes_project_id"] == project_id
     assert {p["session_id"] for p in peers["peers"]} == {"frontend", "a-child"}
     assert next(p for p in peers["peers"] if p["session_id"] == "frontend")["hermes_project_id"] == project_id
-    assert not call("peer_send", "a-child", target_session_id="b-child", message="not linked")["success"]
+    assert not call("peer_send", "a-child", target_session_id="b-child", message="outside family")["success"]
     for same_project in (True, False):
         child = call("peer_sessions", "a-child", same_project=same_project)
         assert child["hermes_project_id"] == project_id
         assert {p["session_id"] for p in child["peers"]} == {"sender"}
-    assert not call("peer_send", "a-child", target_session_id="b-child", message="Project and contacts do not widen family")["success"]
+    assert not call("peer_send", "a-child", target_session_id="b-child", message="Project does not widen family")["success"]
     sent = call("peer_send", "sender", target_session_id="frontend", message="We own the API changes")
     assert sent["status"] == "queued"
     assert call("peer_receive", "frontend")["messages"][0]["message_id"] == sent["message_id"]
@@ -51,7 +51,7 @@ def test_nested_named_project_takes_precedence_over_shared_git_root(install):
     inner = project(install, "API", "/project/api")
     assert call("peer_sessions", "sender")["hermes_project_id"] == inner
     assert "recipient" not in {p["session_id"] for p in call("peer_sessions", "sender")["peers"]}
-    # First contact parent-to-parent remains permitted, but it does not grant team access.
+    # Independent roots can coordinate without widening family access.
     assert call("peer_send", "sender", target_session_id="recipient", message="heads up")["status"] == "queued"
 
 

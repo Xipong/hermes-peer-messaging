@@ -33,12 +33,13 @@ def test_nested_children_keep_team_identity_when_parent_compresses(install):
         assert worker.thread_id == "nested"
         assert not teams.allowed(worker, root)
         assert teams.allowed(worker, teams.resolve(store, "a1"))
-        assert teams.describe(worker) == {
-            "session_id": "nested", "thread_id": "nested", "root_thread_id": "sender",
+        assert teams.describe(worker, viewer=worker) == {
+            "session_id": "nested", "thread_id": "nested",
             "parent_session_id": "a1", "parent_thread_id": "a1", "subagent_id": "task-nested", "is_child": True,
-            "title": None, "source": "subagent",
+            "title": None, "source": "subagent", "relation": "self",
         }
-        assert "root_thread_id" not in teams.describe(worker, viewer=worker)
+        with pytest.raises(ValueError, match="outside"):
+            teams.describe(root, viewer=worker)
         visible_parent = teams.describe(teams.resolve(store, "a1"), viewer=worker)
         assert visible_parent["relation"] == "parent"
         assert visible_parent["parent_session_id"] is None

@@ -56,7 +56,7 @@ def test_fresh_chat_discovers_root_once_without_peer_text_or_writes(install):
     assert not (install / "runtime" / "peer_messages_v2").exists()
     assert start("recipient", "fresh-turn") == ""
     update = work(notices)
-    assert update == {"authority": "peer_data", "neighbors": ["sender"]}
+    assert update == {"neighbors": ["sender"]}
     assert work(notices) is None
     assert work(notices, turn="next-turn") is None
     assert work(notices, sid="elsewhere") is None
@@ -79,7 +79,7 @@ def test_twenty_foreign_workers_across_eight_calls_never_update_root_or_child(in
     monkeypatch.setattr(service, "time", SimpleNamespace(monotonic=lambda: clock[0], time=service.time.time))
     notices = service.InboxNotices()
     assert work(notices)["neighbors"] == ["sender"]
-    assert work(notices, "coordinator-a") == {"authority": "peer_data", "parent": "recipient"}
+    assert work(notices, "coordinator-a") == {"parent": "recipient"}
     index = 0
     for batch in range(8):
         with open_persistence(profile_scope(home=install)) as store:
@@ -259,7 +259,7 @@ def test_awareness_observes_old_live_owners_without_waiting_for_registry_writer(
                 )
                 # The registry writer can remain busy while this normal hook
                 # discovers a live owner outside the persisted recency window.
-                assert future.result(timeout=2.0) == {"authority": "peer_data", "neighbors": ["sender"]}
+                assert future.result(timeout=2.0) == {"neighbors": ["sender"]}
         assert registry.read_bytes() == before and registry.stat().st_mtime_ns == modified
     finally:
         lease.release()
@@ -287,7 +287,7 @@ def test_nested_child_gets_only_immediate_parent_without_ancestor_or_contact_lea
         store.sessions.set_title("sender", "peer-controlled-request")
     pin(install, "reader")
     notices = service.InboxNotices()
-    assert work(notices, "reader") == {"authority": "peer_data", "parent": "parent-child"}
+    assert work(notices, "reader") == {"parent": "parent-child"}
     assert work(notices, "reader", "next-turn") is None
     listed = call("peer_sessions", "reader", scope="all", same_project=False)
     assert listed["success"] and "links" not in listed

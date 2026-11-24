@@ -246,10 +246,10 @@ def test_missing_read_does_not_create_mailbox(tmp_path):
     assert not inbox.exists()
 
 
-def test_legacy_envelope_without_identity_is_not_accepted(tmp_path):
+def test_envelope_without_identity_is_not_accepted(tmp_path):
     key = "00000000000000000001_abcde123"
     path = tmp_path / f"{key}.json"
-    path.write_text(json.dumps({"from_session_id": "sender", "message": "legacy", "sent_at": 1.0}), encoding="utf-8")
+    path.write_text(json.dumps({"from_session_id": "sender", "message": "invalid", "sent_at": 1.0}), encoding="utf-8")
     assert box.read_pending(tmp_path)["messages"] == []
     assert not path.exists()
 

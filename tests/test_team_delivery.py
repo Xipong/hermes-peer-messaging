@@ -3,9 +3,6 @@ import json
 import os
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor
-from contextvars import copy_context
-from importlib import import_module
 from pathlib import Path
 
 import pytest
@@ -200,50 +197,14 @@ def test_pathless_team_discovers_other_batches_and_parent_without_project(instal
     assert ok("peer_receive", "batch-one")["messages"][0]["message_id"] == reply["message_id"]
 
 
-def test_family_policy_preserves_already_published_legacy_v2_mail(teams):
-    mailbox = import_module("peer-messaging.mailbox")
-    # Model a valid v2 envelope published by an older plugin, before the new
-    # family boundary. Historical mail remains recipient-owned until explicit ACK.
-    accepted = mailbox.enqueue(teams / "runtime" / "peer_messages_v2" / "b1",
-                               sender="a1", target="b1", text="Published before the family policy")
-    assert not call("peer_send", "a1", target_session_id="b1", message="Cannot publish new cross-family mail")["success"]
-    assert ok("peer_receive", "b1")["messages"][0]["message_id"] == accepted["message_id"]
-    assert set(peers("a1")) == {"sender", "a2"}
-    assert not call("peer_send", "a1", target_session_id="b1", message="still outside family")["success"]
-    assert not call("peer_send", "b1", target_session_id="sender", message="still outside family")["success"]
-    assert ok("peer_receive", "b1")["messages"][0]["message_id"] == accepted["message_id"]
-    assert ok("peer_receive", "b1", action="ack", message_ids=[accepted["message_id"]])["acknowledged"] == [accepted["message_id"]]
-    assert ok("peer_send", "a1", target_session_id="a2", message="Own team still reachable")["status"] == "queued"
-
-
-def test_legacy_contact_graph_is_ignored_and_untouched(teams):
-    from hermes_cli.active_sessions import _FileLock
-
-    folder = teams / "runtime" / "peer_messages_v2"
-    folder.mkdir(parents=True, exist_ok=True)
-    graph = folder / ".threads.json"
-    graph.write_text('{"version":2,"links":{"recipient:sender":["recipient","sender"]}}')
-    (folder / ".threads.lock").touch()
-    before, modified = graph.read_bytes(), graph.stat().st_mtime_ns
-    entries = set(folder.iterdir())
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        with _FileLock(folder / ".threads.lock", timeout=1.0):
-            for sender, target in (("a1", "b1"), ("a1", "recipient"), ("sender", "b1")):
-                future = executor.submit(copy_context().run, call, "peer_send", sender,
-                                         target_session_id=target, message="Linked but outside immediate family")
-                refused = future.result(timeout=1.0)
-                assert refused["success"] is False and not refused.get("retryable"), refused
-            assert set(folder.iterdir()) == entries
-            assert graph.read_bytes() == before and graph.stat().st_mtime_ns == modified
-            # Sending does not depend on the root contact graph or wait for its writer.
-            for sender, target in (("a1", "a2"), ("sender", "recipient")):
-                future = executor.submit(copy_context().run, call, "peer_send", sender,
-                                         target_session_id=target, message="Allowed while contacts are busy")
-                sent = future.result(timeout=1.0)
-                assert sent["status"] == "queued", sent
-                assert ok("peer_receive", target)["messages"][0]["message_id"] == sent["message_id"]
-    assert graph.read_bytes() == before and graph.stat().st_mtime_ns == modified
-    assert not (folder / "b1").exists()
+def test_recipient_can_read_published_mail_after_sender_finishes(teams):
+    sent = ok("peer_send", "a1", target_session_id="a2", message="Finding before completion")
+    with open_persistence(profile_scope(home=teams)) as store:
+        store.sessions.end("a1", "agent_close")
+    assert "a1" not in peers("a2")
+    assert not call("peer_send", "a2", target_session_id="a1", message="Closed recipient")["success"]
+    assert ok("peer_receive", "a2")["messages"][0]["message_id"] == sent["message_id"]
+    assert ok("peer_receive", "a2", action="ack", message_ids=[sent["message_id"]])["acknowledged"] == [sent["message_id"]]
 
 
 def test_gateway_foreign_or_unattributed_children_cannot_route_as_local_teams(teams):
@@ -270,7 +231,7 @@ def test_branched_root_and_its_children_remain_separate(teams):
         add_child(store, "branched-child", "branched-root")
     assert set(peers("branched-child")) == {"branched-root"}
     assert peers("branched-child")["branched-root"]["thread_id"] == "branched-root"
-    assert not call("peer_send", "branched-child", target_session_id="b1", message="no inherited link")["success"]
+    assert not call("peer_send", "branched-child", target_session_id="b1", message="different root")["success"]
     assert not call("peer_send", "a1", target_session_id="branched-child", message="separate root")["success"]
 
 

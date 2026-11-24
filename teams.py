@@ -61,7 +61,7 @@ def _locate(store, sid, *, allow_ended=False):
     seen = {tip.session_id}
     while first.parent_session_id and first.parent_session_id not in seen:
         parent = store.sessions.get(mailbox.session_component(first.parent_session_id))
-        if not parent or parent.end_reason != "compression":
+        if not parent or parent.end_reason != END_REASON_COMPRESSION:
             break
         try:
             if _route(store, parent.session_id, allow_ended=allow_ended).session_id != tip.session_id:
@@ -71,8 +71,6 @@ def _locate(store, sid, *, allow_ended=False):
         seen.add(parent.session_id)
         first = parent
     return first.session_id, tip
-
-
 
 
 @dataclass(frozen=True)
